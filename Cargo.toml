@@ -11,6 +11,6 @@ keywords = ["mock", "mockrs"]
 categories = ["development-tools::testing"]
 
 [dependencies]
-lazy_static="*"
-nix={version="*", features=["mman", "signal"]}
+lazy_static="1.5.*"
+nix={version="0.29.*", features=["mman", "signal"]}
 
