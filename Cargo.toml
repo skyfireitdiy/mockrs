@@ -1,0 +1,16 @@
+[package]
+name = "mockrs"
+version = "0.1.0"
+edition = "2021"
+authors = ["skyfire <skyfireitdiy@hotmail.com>"]
+description = "A crate that provides a X8664Mocker to mock function calls and intercept on x86_64 architecture."
+license = "MIT"
+repository = "https://github.com/skyfireitdiy/mockrs"
+readme = "README.md"
+keywords = ["mock", "mockrs"]
+categories = ["development-tools::testing"]
+
+[dependencies]
+lazy_static="*"
+nix={version="*", features=["mman", "signal"]}
+
