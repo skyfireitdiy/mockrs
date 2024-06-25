@@ -17,7 +17,7 @@ To use the `mockrs`, include it in your `Cargo.toml` and then import it in your 
 
 ```toml
 [dependencies]
-X8664Mocker = "0.1.0" # Replace with the actual version number
+mockrs = "0.1.*" # Replace with the actual version number
 ```
 
 
