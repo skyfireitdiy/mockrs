@@ -10,7 +10,7 @@ fn mock_add() -> i32 {
 
 fn main() {
     let m = mock!(add, mock_add);
-    // println!("1 + 2 = {}", add(1, 2));
+    println!("1 + 2 = {}", add(1, 2));
     drop(m);
     println!("1 + 2 = {}", add(1, 2)); // should print 100
 }

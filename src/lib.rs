@@ -19,7 +19,7 @@
 
 use lazy_static::lazy_static;
 use nix::{
-    libc::{gettid, siginfo_t, ucontext_t, REG_EFL, REG_RIP},
+    libc::{siginfo_t, ucontext_t, REG_EFL, REG_RIP},
     sys::{
         mman::{mmap_anonymous, mprotect, MapFlags, ProtFlags},
         signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal},
@@ -33,6 +33,7 @@ use std::{
     num::NonZeroUsize,
     ptr::NonNull,
     sync::Mutex,
+    thread::ThreadId,
 };
 
 pub struct X8664Mocker {
@@ -57,7 +58,7 @@ struct InstrPosition {
 static CURRENT_POSITION: Mutex<Cell<usize>> = Mutex::new(Cell::new(0));
 
 lazy_static! {
-    static ref THREAD_REPLACE_TABLE: Mutex<HashMap<i32, RefCell<HashMap<usize, usize>>>> =
+    static ref THREAD_REPLACE_TABLE: Mutex<HashMap<ThreadId, RefCell<HashMap<usize, usize>>>> =
         Mutex::new(HashMap::new());
 }
 
@@ -128,14 +129,22 @@ fn set_ip_reg(ctx: *mut ucontext_t, new_func_addr: usize) {
 
 macro_rules! read_thread_local {
     ($name:expr) => {
-        $name.lock().unwrap().get(unsafe { &gettid() })
+        $name.lock().unwrap().get(&std::thread::current().id())
     };
 }
 
 macro_rules! create_thread_local {
     ($name:expr, $value:expr) => {
-        if $name.lock().unwrap().get(unsafe { &gettid() }).is_none() {
-            $name.lock().unwrap().insert(unsafe { gettid() }, $value);
+        if $name
+            .lock()
+            .unwrap()
+            .get(&std::thread::current().id())
+            .is_none()
+        {
+            $name
+                .lock()
+                .unwrap()
+                .insert(std::thread::current().id(), $value);
         }
     };
 }
