@@ -38,6 +38,7 @@ use std::{
 
 pub struct X8664Mocker {
     old_func: usize,
+    new_func: usize,
 }
 
 lazy_static! {
@@ -58,7 +59,7 @@ struct InstrPosition {
 static CURRENT_POSITION: Mutex<Cell<usize>> = Mutex::new(Cell::new(0));
 
 lazy_static! {
-    static ref THREAD_REPLACE_TABLE: Mutex<HashMap<ThreadId, RefCell<HashMap<usize, usize>>>> =
+    static ref THREAD_REPLACE_TABLE: Mutex<HashMap<ThreadId, RefCell<HashMap<usize, Vec<usize>>>>> =
         Mutex::new(HashMap::new());
 }
 
@@ -155,6 +156,8 @@ fn get_new_func_addr(old_func: usize) -> usize {
         .borrow_mut()
         .get(&old_func)
         .unwrap()
+        .last()
+        .unwrap()
 }
 
 fn is_current_thread_mocked(old_func: usize) -> bool {
@@ -206,12 +209,26 @@ impl X8664Mocker {
         }
 
         create_thread_local!(THREAD_REPLACE_TABLE, RefCell::new(HashMap::new()));
-        read_thread_local!(THREAD_REPLACE_TABLE)
+        if read_thread_local!(THREAD_REPLACE_TABLE)
             .unwrap()
-            .borrow_mut()
-            .insert(old_func, new_func);
+            .borrow()
+            .get(&old_func)
+            .is_some()
+        {
+            read_thread_local!(THREAD_REPLACE_TABLE)
+                .unwrap()
+                .borrow_mut()
+                .get_mut(&old_func)
+                .unwrap()
+                .push(new_func);
+        } else {
+            read_thread_local!(THREAD_REPLACE_TABLE)
+                .unwrap()
+                .borrow_mut()
+                .insert(old_func, vec![new_func]);
+        }
 
-        X8664Mocker { old_func }
+        X8664Mocker { old_func, new_func }
     }
 }
 
@@ -314,7 +331,21 @@ impl Drop for X8664Mocker {
         read_thread_local!(THREAD_REPLACE_TABLE)
             .unwrap()
             .borrow_mut()
-            .remove(&self.old_func);
+            .get_mut(&self.old_func)
+            .unwrap()
+            .retain(|&new_func| new_func != self.new_func);
+        if read_thread_local!(THREAD_REPLACE_TABLE)
+            .unwrap()
+            .borrow()
+            .get(&self.old_func)
+            .unwrap()
+            .is_empty()
+        {
+            read_thread_local!(THREAD_REPLACE_TABLE)
+                .unwrap()
+                .borrow_mut()
+                .remove(&self.old_func);
+        }
     }
 }
 
