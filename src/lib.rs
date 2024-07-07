@@ -63,7 +63,7 @@ lazy_static! {
 }
 
 thread_local! {
-    static CURRENT_REPLACE: Cell<InstrPosition> = Cell::new(InstrPosition{orig_addr: 0, trunk_addr: 0});
+    static CURRENT_REPLACE: Cell<InstrPosition> = const { Cell::new(InstrPosition{orig_addr: 0, trunk_addr: 0}) };
 }
 
 fn get_page_bound(addr: usize, len: usize) -> (usize, usize) {
