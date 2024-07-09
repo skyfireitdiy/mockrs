@@ -13,4 +13,4 @@ categories = ["development-tools::testing"]
 [dependencies]
 lazy_static="1.5.*"
 nix={version="0.29.*", features=["mman", "signal"]}
-
+iced-x86 = "1.21.*"

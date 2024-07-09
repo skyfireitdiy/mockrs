@@ -44,7 +44,7 @@ mod mockrs_tests {
         }
 
         fn original_function2() -> f64 {
-            println!("this is print");
+            // println!("this is print");
             3.14
         }
 

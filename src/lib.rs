@@ -19,7 +19,7 @@
 
 use lazy_static::lazy_static;
 use nix::{
-    libc::{siginfo_t, ucontext_t, REG_EFL, REG_RIP},
+    libc::{siginfo_t, ucontext_t, RAX, RBP, REG_EFL, REG_RIP},
     sys::{
         mman::{mmap_anonymous, mprotect, MapFlags, ProtFlags},
         signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal},
@@ -34,6 +34,11 @@ use std::{
     ptr::NonNull,
     sync::Mutex,
     thread::ThreadId,
+};
+
+use iced_x86::{
+    BlockEncoder, BlockEncoderOptions, Decoder, DecoderOptions, Encoder, Formatter, GasFormatter,
+    Instruction, InstructionBlock, Register,
 };
 
 pub struct X8664Mocker {
@@ -65,6 +70,17 @@ lazy_static! {
 
 thread_local! {
     static CURRENT_REPLACE: Cell<InstrPosition> = const { Cell::new(InstrPosition{orig_addr: 0, trunk_addr: 0}) };
+}
+
+fn disassemble_instruction(ins: &[u8], addr: u64) -> Option<Instruction> {
+    let mut decoder = Decoder::with_ip(64, ins, addr, DecoderOptions::NONE);
+    let mut instruction = Instruction::default();
+    if decoder.can_decode() {
+        decoder.decode_out(&mut instruction);
+        Some(instruction)
+    } else {
+        None
+    }
 }
 
 fn get_page_bound(addr: usize, len: usize) -> (usize, usize) {
@@ -202,10 +218,16 @@ impl X8664Mocker {
         init_mock();
 
         if !is_mocked(old_func) {
-            save_func_trunk(old_func, read_memory(old_func, REPLACE_LEN).as_slice());
-            set_mem_writable(old_func, 1);
-            write_memory(old_func, [0xcc].as_slice());
-            unset_mem_writable(old_func, 1);
+            let ins_mem = read_memory(old_func, REPLACE_LEN).clone();
+            let mut replace_mem = ins_mem.clone();
+            if let Some(ins) = disassemble_instruction(&ins_mem, old_func as u64) {
+                save_func_trunk(old_func, &ins);
+                set_mem_writable(old_func, 1);
+                write_memory(old_func, [0xcc].as_slice());
+                unset_mem_writable(old_func, 1);
+            } else {
+                panic!("Failed to disassemble instruction at 0x{:x}", old_func);
+            }
         }
 
         create_thread_local!(THREAD_REPLACE_TABLE, RefCell::new(HashMap::new()));
@@ -232,15 +254,61 @@ impl X8664Mocker {
     }
 }
 
-fn save_func_trunk(old_func: usize, trunk: &[u8]) {
+fn replace_instruction_register(ins: &Instruction, reg: Register) -> Instruction {
+    let mut ins = ins.clone();
+    for r in 0..=4 {
+        if ins.op_register(r).is_ip() {
+            ins.set_op_register(r, reg);
+        }
+    }
+    ins
+}
+
+fn get_valid_replace_register(ins: &Instruction) -> Register {
+    let registers = [
+        Register::RAX,
+        Register::RBX,
+        Register::RCX,
+        Register::RDX,
+        Register::R8,
+        Register::R9,
+    ];
+    for r in registers.iter() {
+        let mut flag = true;
+        for i in 0..=4 {
+            if ins.op_register(i) == *r {
+                flag = false;
+                break;
+            }
+        }
+        if flag {
+            return *r;
+        }
+    }
+    return Register::RAX;
+}
+
+fn save_func_trunk(old_func: usize, ins: &Instruction) {
     let current_position = CURRENT_POSITION.lock().unwrap();
     TRUNK_ADDR_TABLE
         .lock()
         .unwrap()
         .get_mut()
         .insert(old_func, current_position.get());
-    write_memory(current_position.get(), trunk);
-    current_position.set(current_position.get() + trunk.len());
+
+    let buffer = [*ins];
+    let block = InstructionBlock::new(&buffer, current_position.get() as u64);
+
+    match BlockEncoder::encode(64, block, BlockEncoderOptions::NONE) {
+        Ok(result) => {
+            write_memory(current_position.get(), &result.code_buffer);
+            current_position.set(current_position.get() + result.code_buffer.len());
+        }
+        Err(e) => {
+            println!("{}", e.to_string());
+            panic!("Failed to encode instruction block");
+        }
+    }
 }
 
 fn is_mocked(addr: usize) -> bool {
@@ -276,7 +344,7 @@ fn alloc_code_area() {
     unsafe {
         let code_area = mmap_anonymous(
             None,
-            NonZeroUsize::new(0x1000).unwrap(),
+            NonZeroUsize::new(0x8000).unwrap(),
             ProtFlags::PROT_READ | ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC,
             MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
         )
