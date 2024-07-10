@@ -7,8 +7,6 @@ The `mockrs` crate provides a powerful tool for function mocking and interceptio
 ## Key Features
 
 - **Function Mocking**: Replace the functionality of a function with a mock implementation.
-- **Signal Handling**: Utilizes signal handling to manage function interception.
-- **Memory Management**: Safely manipulates memory to inject mock behavior.
 - **Thread-Local Storage**: Keeps track of mocks on a per-thread basis.
 
 ## Usage
@@ -64,15 +62,6 @@ A convenient macro to create a new `X8664Mocker` instance.
 - The `mockrs` operates at a low level, manipulating memory and handling signals. Use it with caution and ensure that the original and new functions have compatible signatures.
 - This crate is designed for use on the x86_64 architecture only.
 
-### Warning
-
-1. The `mockrs` crate cannot be applied to functions that have the first instruction as relative PC addressing, such as:
-
-```rust
-fn f() -> f64 {
-    3.14
-}
-```
 
 ## Contribution
 
