@@ -112,7 +112,7 @@ fn leave_step_mode(ctx: *mut ucontext_t) {
     unsafe { (*ctx).uc_mcontext.gregs[REG_EFL as usize] &= !0x100 };
 }
 
-fn get_reg_index_context(reg: u8) -> i32 {
+fn get_context_reg_index(reg: u8) -> i32 {
     if reg == Register::RAX as u8 {
         return REG_RAX;
     } else if reg == Register::RBX as u8 {
@@ -121,10 +121,10 @@ fn get_reg_index_context(reg: u8) -> i32 {
         return REG_RCX;
     } else if reg == Register::RDX as u8 {
         return REG_RDX;
-    } else if reg == Register::R8 as u8 {
-        return REG_R8;
-    } else if reg == Register::R9 as u8 {
-        return REG_R9;
+    } else if reg == Register::RDI as u8 {
+        return REG_RDI;
+    } else if reg == Register::RSI as u8 {
+        return REG_RSI;
     }
     return -1;
 }
@@ -138,10 +138,10 @@ extern "C" fn handle_trap_signal(_: i32, _: *mut siginfo_t, ucontext: *mut c_voi
         let orig_addr = rip - 1;
 
         if is_current_thread_mocked(orig_addr) {
-            set_ip_reg(ctx, get_new_func_addr(orig_addr));
+            set_ip_register(ctx, get_new_func_addr(orig_addr));
         } else {
             enter_step_mode(ctx);
-            let trunk_addr = get_trunk_addr(orig_addr);
+            let trunk_addr = get_bak_instruction_addr(orig_addr);
             let mut patch = InstrPosition::default();
             CURRENT_REPLACE.with(|x| {
                 patch.orig_addr = orig_addr;
@@ -152,7 +152,7 @@ extern "C" fn handle_trap_signal(_: i32, _: *mut siginfo_t, ucontext: *mut c_voi
                 patch.replace_reg = buf[2];
                 x.set(patch);
             });
-            let r = get_reg_index_context(patch.replace_reg);
+            let r = get_context_reg_index(patch.replace_reg);
 
             if r != -1 {
                 unsafe {
@@ -161,7 +161,7 @@ extern "C" fn handle_trap_signal(_: i32, _: *mut siginfo_t, ucontext: *mut c_voi
                 };
             }
 
-            set_ip_reg(ctx, trunk_addr + 3);
+            set_ip_register(ctx, trunk_addr + 3);
         }
     } else {
         leave_step_mode(ctx);
@@ -174,7 +174,7 @@ extern "C" fn handle_trap_signal(_: i32, _: *mut siginfo_t, ucontext: *mut c_voi
             replace_data,
         } = CURRENT_REPLACE.with(|x| x.get());
 
-        let r = get_reg_index_context(replace_reg);
+        let r = get_context_reg_index(replace_reg);
 
         if r != -1 {
             unsafe {
@@ -182,12 +182,12 @@ extern "C" fn handle_trap_signal(_: i32, _: *mut siginfo_t, ucontext: *mut c_voi
             }
         }
         if rip - (trunk_addr + 3) == new_len as usize {
-            set_ip_reg(ctx, orig_addr + old_len as usize);
+            set_ip_register(ctx, orig_addr + old_len as usize);
         }
     }
 }
 
-fn get_trunk_addr(old_func: usize) -> usize {
+fn get_bak_instruction_addr(old_func: usize) -> usize {
     *TRUNK_ADDR_TABLE
         .lock()
         .unwrap()
@@ -196,7 +196,7 @@ fn get_trunk_addr(old_func: usize) -> usize {
         .unwrap()
 }
 
-fn set_ip_reg(ctx: *mut ucontext_t, new_func_addr: usize) {
+fn set_ip_register(ctx: *mut ucontext_t, new_func_addr: usize) {
     unsafe { (*ctx).uc_mcontext.gregs[REG_RIP as usize] = new_func_addr as i64 };
 }
 
@@ -277,7 +277,7 @@ impl X8664Mocker {
             let ins_mem = read_memory(old_func, REPLACE_LEN).clone();
 
             if let Some(ins) = disassemble_instruction(&ins_mem, old_func as u64) {
-                save_func_trunk(old_func, &ins);
+                save_old_instruction(old_func, &ins);
                 set_mem_writable(old_func, 1);
                 write_memory(old_func, [0xcc].as_slice());
                 unset_mem_writable(old_func, 1);
@@ -317,23 +317,26 @@ fn get_replace_register(ins: &Instruction) -> Register {
         Register::RBX,
         Register::RCX,
         Register::RDX,
-        Register::R8,
-        Register::R9,
+        Register::RDI,
+        Register::RSI,
     ]
     .iter()
     .find(|r| regs.iter().find(|t| t == r).is_none())
     .unwrap()
 }
 
-fn replace_instruction_register(ins: Instruction, reg: Register) -> Instruction {
+fn make_new_instruction(ins: Instruction, reg: Register) -> Instruction {
     let mut bak_ins = ins.clone();
     if bak_ins.memory_base().is_ip() {
         bak_ins.set_memory_base(reg);
+        bak_ins.set_memory_displacement64(
+            ins.memory_displacement64().overflowing_sub(ins.next_ip()).0,
+        );
     }
     bak_ins
 }
 
-fn save_func_trunk(old_func: usize, ins: &Instruction) {
+fn save_old_instruction(old_func: usize, ins: &Instruction) {
     let current_position = CURRENT_POSITION.lock().unwrap();
     TRUNK_ADDR_TABLE
         .lock()
@@ -347,10 +350,7 @@ fn save_func_trunk(old_func: usize, ins: &Instruction) {
 
     if ins.is_ip_rel_memory_operand() {
         replace_reg = get_replace_register(ins);
-        new_instruction = replace_instruction_register(ins.clone(), replace_reg);
-        new_instruction.set_memory_displacement64(
-            ins.memory_displacement64().overflowing_sub(ins.next_ip()).0,
-        );
+        new_instruction = make_new_instruction(ins.clone(), replace_reg);
     }
 
     let mut encoder = Encoder::new(64);
