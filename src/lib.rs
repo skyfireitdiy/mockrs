@@ -1,4 +1,3 @@
-//! 该模块提供了一个 `X8664Mocker` 结构体，用于模拟函数调用并拦截。
 //! 示例：
 //! ```
 //! use mockrs::mock;
@@ -19,7 +18,7 @@
 
 use lazy_static::lazy_static;
 use nix::{
-    libc::{siginfo_t, ucontext_t, RAX, RBP, REG_EFL, REG_RIP},
+    libc::*,
     sys::{
         mman::{mmap_anonymous, mprotect, MapFlags, ProtFlags},
         signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal},
@@ -36,10 +35,7 @@ use std::{
     thread::ThreadId,
 };
 
-use iced_x86::{
-    BlockEncoder, BlockEncoderOptions, Decoder, DecoderOptions, Encoder, Formatter, GasFormatter,
-    Instruction, InstructionBlock, Register,
-};
+use iced_x86::{Decoder, DecoderOptions, Encoder, Instruction, Register};
 
 pub struct X8664Mocker {
     old_func: usize,
@@ -59,6 +55,23 @@ static CODE_AREA: Mutex<RefCell<usize>> = Mutex::new(RefCell::new(0));
 struct InstrPosition {
     orig_addr: usize,
     trunk_addr: usize,
+    old_len: u8,
+    new_len: u8,
+    replace_reg: u8,
+    replace_data: i64,
+}
+
+impl Default for InstrPosition {
+    fn default() -> Self {
+        Self {
+            orig_addr: 0,
+            trunk_addr: 0,
+            old_len: 0,
+            new_len: 0,
+            replace_reg: 0,
+            replace_data: 0,
+        }
+    }
 }
 
 static CURRENT_POSITION: Mutex<Cell<usize>> = Mutex::new(Cell::new(0));
@@ -69,7 +82,7 @@ lazy_static! {
 }
 
 thread_local! {
-    static CURRENT_REPLACE: Cell<InstrPosition> = const { Cell::new(InstrPosition{orig_addr: 0, trunk_addr: 0}) };
+    static CURRENT_REPLACE: Cell<InstrPosition> = const { Cell::new(InstrPosition{orig_addr: 0, trunk_addr: 0,old_len:0, new_len:0, replace_reg: Register::None as u8, replace_data: 0}) };
 }
 
 fn disassemble_instruction(ins: &[u8], addr: u64) -> Option<Instruction> {
@@ -99,10 +112,27 @@ fn leave_step_mode(ctx: *mut ucontext_t) {
     unsafe { (*ctx).uc_mcontext.gregs[REG_EFL as usize] &= !0x100 };
 }
 
+fn get_reg_index_context(reg: u8) -> i32 {
+    if reg == Register::RAX as u8 {
+        return REG_RAX;
+    } else if reg == Register::RBX as u8 {
+        return REG_RBX;
+    } else if reg == Register::RCX as u8 {
+        return REG_RCX;
+    } else if reg == Register::RDX as u8 {
+        return REG_RDX;
+    } else if reg == Register::R8 as u8 {
+        return REG_R8;
+    } else if reg == Register::R9 as u8 {
+        return REG_R9;
+    }
+    return -1;
+}
+
 extern "C" fn handle_trap_signal(_: i32, _: *mut siginfo_t, ucontext: *mut c_void) {
     let ctx = ucontext as *mut ucontext_t;
-    let rip = (unsafe { *ctx }).uc_mcontext.gregs[REG_RIP as usize] as usize;
-    let eflags = (unsafe { *ctx }).uc_mcontext.gregs[REG_EFL as usize];
+    let rip = unsafe { (*ctx).uc_mcontext.gregs[REG_RIP as usize] as usize };
+    let eflags = unsafe { (*ctx).uc_mcontext.gregs[REG_EFL as usize] };
 
     if !is_step_mode(eflags) {
         let orig_addr = rip - 1;
@@ -112,22 +142,48 @@ extern "C" fn handle_trap_signal(_: i32, _: *mut siginfo_t, ucontext: *mut c_voi
         } else {
             enter_step_mode(ctx);
             let trunk_addr = get_trunk_addr(orig_addr);
+            let mut patch = InstrPosition::default();
             CURRENT_REPLACE.with(|x| {
-                x.set(InstrPosition {
-                    orig_addr,
-                    trunk_addr,
-                });
+                patch.orig_addr = orig_addr;
+                patch.trunk_addr = trunk_addr;
+                let buf = read_memory(trunk_addr, 3);
+                patch.old_len = buf[0];
+                patch.new_len = buf[1];
+                patch.replace_reg = buf[2];
+                x.set(patch);
             });
-            set_ip_reg(ctx, trunk_addr);
+            let r = get_reg_index_context(patch.replace_reg);
+
+            if r != -1 {
+                unsafe {
+                    patch.replace_data = (*ctx).uc_mcontext.gregs[r as usize];
+                    (*ctx).uc_mcontext.gregs[r as usize] = orig_addr as i64 + patch.old_len as i64;
+                };
+            }
+
+            set_ip_reg(ctx, trunk_addr + 3);
         }
     } else {
         leave_step_mode(ctx);
         let InstrPosition {
             orig_addr,
-            trunk_addr: code_trunk_addr,
+            trunk_addr,
+            old_len,
+            new_len: _,
+            replace_reg,
+            replace_data,
         } = CURRENT_REPLACE.with(|x| x.get());
-        let old_func_next_instr = orig_addr + (rip - code_trunk_addr);
-        set_ip_reg(ctx, old_func_next_instr);
+
+        let r = get_reg_index_context(replace_reg);
+
+        if r != -1 {
+            unsafe {
+                (*ctx).uc_mcontext.gregs[r as usize] = replace_data;
+            }
+        }
+        if unsafe { (*ctx).uc_mcontext.gregs[REG_RIP as usize] - trunk_addr as i64 + 3 < 16 } {
+            set_ip_reg(ctx, orig_addr + old_len as usize);
+        }
     }
 }
 
@@ -219,7 +275,7 @@ impl X8664Mocker {
 
         if !is_mocked(old_func) {
             let ins_mem = read_memory(old_func, REPLACE_LEN).clone();
-            let mut replace_mem = ins_mem.clone();
+
             if let Some(ins) = disassemble_instruction(&ins_mem, old_func as u64) {
                 save_func_trunk(old_func, &ins);
                 set_mem_writable(old_func, 1);
@@ -254,38 +310,27 @@ impl X8664Mocker {
     }
 }
 
-fn replace_instruction_register(ins: &Instruction, reg: Register) -> Instruction {
-    let mut ins = ins.clone();
-    for r in 0..=4 {
-        if ins.op_register(r).is_ip() {
-            ins.set_op_register(r, reg);
-        }
-    }
-    ins
-}
-
-fn get_valid_replace_register(ins: &Instruction) -> Register {
-    let registers = [
+fn get_replace_register(ins: &Instruction) -> Register {
+    let regs: Vec<Register> = (0..=4u32).map(|i| ins.op_register(i)).collect();
+    *[
         Register::RAX,
         Register::RBX,
         Register::RCX,
         Register::RDX,
         Register::R8,
         Register::R9,
-    ];
-    for r in registers.iter() {
-        let mut flag = true;
-        for i in 0..=4 {
-            if ins.op_register(i) == *r {
-                flag = false;
-                break;
-            }
-        }
-        if flag {
-            return *r;
-        }
+    ]
+    .iter()
+    .find(|r| regs.iter().find(|t| t == r).is_none())
+    .unwrap()
+}
+
+fn replace_instruction_register(ins: Instruction, reg: Register) -> Instruction {
+    let mut bak_ins = ins.clone();
+    if bak_ins.memory_base().is_ip() {
+        bak_ins.set_memory_base(reg);
     }
-    return Register::RAX;
+    bak_ins
 }
 
 fn save_func_trunk(old_func: usize, ins: &Instruction) {
@@ -296,13 +341,32 @@ fn save_func_trunk(old_func: usize, ins: &Instruction) {
         .get_mut()
         .insert(old_func, current_position.get());
 
-    let buffer = [*ins];
-    let block = InstructionBlock::new(&buffer, current_position.get() as u64);
+    let old_len = ins.len();
+    let mut replace_reg = Register::None;
+    let mut new_instruction = ins.clone();
 
-    match BlockEncoder::encode(64, block, BlockEncoderOptions::NONE) {
-        Ok(result) => {
-            write_memory(current_position.get(), &result.code_buffer);
-            current_position.set(current_position.get() + result.code_buffer.len());
+    if ins.is_ip_rel_memory_operand() {
+        replace_reg = get_replace_register(ins);
+        new_instruction = replace_instruction_register(ins.clone(), replace_reg);
+        new_instruction.set_memory_displacement64(
+            ins.memory_displacement64().overflowing_sub(ins.next_ip()).0,
+        );
+    }
+
+    let mut encoder = Encoder::new(64);
+    match encoder.encode(&new_instruction, ins.ip()) {
+        Ok(new_len) => {
+            write_memory(current_position.get(), &[old_len as u8]);
+            current_position.set(current_position.get() + 1);
+
+            write_memory(current_position.get(), &[new_len as u8]);
+            current_position.set(current_position.get() + 1);
+
+            write_memory(current_position.get(), &[replace_reg as u8]);
+            current_position.set(current_position.get() + 1);
+
+            write_memory(current_position.get(), &encoder.take_buffer());
+            current_position.set(current_position.get() + new_len);
         }
         Err(e) => {
             println!("{}", e.to_string());
