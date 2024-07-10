@@ -169,7 +169,7 @@ extern "C" fn handle_trap_signal(_: i32, _: *mut siginfo_t, ucontext: *mut c_voi
             orig_addr,
             trunk_addr,
             old_len,
-            new_len: _,
+            new_len,
             replace_reg,
             replace_data,
         } = CURRENT_REPLACE.with(|x| x.get());
@@ -181,7 +181,7 @@ extern "C" fn handle_trap_signal(_: i32, _: *mut siginfo_t, ucontext: *mut c_voi
                 (*ctx).uc_mcontext.gregs[r as usize] = replace_data;
             }
         }
-        if unsafe { (*ctx).uc_mcontext.gregs[REG_RIP as usize] - trunk_addr as i64 + 3 < 16 } {
+        if rip - (trunk_addr + 3) == new_len as usize {
             set_ip_reg(ctx, orig_addr + old_len as usize);
         }
     }
