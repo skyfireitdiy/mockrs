@@ -46,7 +46,7 @@ lazy_static! {
     static ref TRUNK_ADDR_TABLE: Mutex<RefCell<HashMap<usize, usize>>> =
         Mutex::new(RefCell::new(HashMap::new()));
 }
-static REPLACE_LEN: usize = 8;
+static REPLACE_LEN: usize = 16;
 static INIT_FLAG: Mutex<OnceCell<()>> = Mutex::new(OnceCell::new());
 
 static CODE_AREA: Mutex<RefCell<usize>> = Mutex::new(RefCell::new(0));
