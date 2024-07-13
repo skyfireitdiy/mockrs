@@ -280,7 +280,7 @@ impl X8664Mocker {
                 save_old_instruction(old_func, &ins);
                 set_mem_writable(old_func, 1);
                 write_memory(old_func, [0xcc].as_slice());
-                unset_mem_writable(old_func, 1);
+            // 不去除内存的可写权限，因为在并法同时给一个函数进行mock的时候会有问题
             } else {
                 panic!("Failed to disassemble instruction at 0x{:x}", old_func);
             }
@@ -441,18 +441,6 @@ fn set_mem_writable(old_func: usize, len: usize) {
             NonNull::new(low as *mut c_void).unwrap(),
             high - low,
             ProtFlags::PROT_READ | ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC,
-        )
-        .unwrap()
-    };
-}
-
-fn unset_mem_writable(old_func: usize, len: usize) {
-    let (low, high) = get_page_bound(old_func, len);
-    unsafe {
-        mprotect(
-            NonNull::new(low as *mut c_void).unwrap(),
-            high - low,
-            ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
         )
         .unwrap()
     };
