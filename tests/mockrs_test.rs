@@ -18,8 +18,8 @@ mod mockrs_tests {
         let mocker = mock!(original_function, mock_function);
 
         // Create two threads to call the original function
-        let thread1 = thread::spawn(|| original_function());
-        let thread2 = thread::spawn(|| original_function());
+        let thread1 = thread::spawn(original_function);
+        let thread2 = thread::spawn(original_function);
 
         // Assert that the original function returns the expected value in both threads
         assert_eq!(thread1.join().unwrap(), 42);

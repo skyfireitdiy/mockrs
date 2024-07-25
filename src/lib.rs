@@ -31,7 +31,7 @@ use std::{
     ffi::c_void,
     num::NonZeroUsize,
     ptr::NonNull,
-    sync::Mutex,
+    sync::{Mutex, MutexGuard},
     thread::ThreadId,
 };
 
@@ -273,16 +273,23 @@ impl X8664Mocker {
     pub fn mock(old_func: usize, new_func: usize) -> X8664Mocker {
         init_mock();
 
-        if !is_mocked(old_func) {
-            let ins_mem = read_memory(old_func, REPLACE_LEN).clone();
+        {
+            let mut addr_table = TRUNK_ADDR_TABLE.lock().unwrap();
+            if addr_table.get_mut().get(&old_func).is_none() {
+                let ins_mem = read_memory(old_func, REPLACE_LEN).clone();
 
-            if let Some(ins) = disassemble_instruction(&ins_mem, old_func as u64) {
-                save_old_instruction(old_func, &ins);
-                set_mem_writable(old_func, 1);
-                write_memory(old_func, [0xcc].as_slice());
-            // 不去除内存的可写权限，因为在并法同时给一个函数进行mock的时候会有问题
-            } else {
-                panic!("Failed to disassemble instruction at 0x{:x}", old_func);
+                if let Some(ins) = disassemble_instruction(&ins_mem, old_func as u64) {
+                    let current_position = CURRENT_POSITION.lock().unwrap();
+                    addr_table
+                        .get_mut()
+                        .insert(old_func, current_position.get());
+                    save_old_instruction(&ins, current_position);
+                    set_mem_writable(old_func, 1);
+                    write_memory(old_func, [0xcc].as_slice());
+                // 不去除内存的可写权限，因为在并法同时给一个函数进行mock的时候会有问题
+                } else {
+                    panic!("Failed to disassemble instruction at 0x{:x}", old_func);
+                }
             }
         }
 
@@ -336,14 +343,7 @@ fn make_new_instruction(ins: Instruction, reg: Register) -> Instruction {
     bak_ins
 }
 
-fn save_old_instruction(old_func: usize, ins: &Instruction) {
-    let current_position = CURRENT_POSITION.lock().unwrap();
-    TRUNK_ADDR_TABLE
-        .lock()
-        .unwrap()
-        .get_mut()
-        .insert(old_func, current_position.get());
-
+fn save_old_instruction(ins: &Instruction, current_position: MutexGuard<Cell<usize>>) {
     let old_len = ins.len();
     let mut replace_reg = Register::None;
     let mut new_instruction = ins.clone();
@@ -373,14 +373,6 @@ fn save_old_instruction(old_func: usize, ins: &Instruction) {
             panic!("Failed to encode instruction block");
         }
     }
-}
-
-fn is_mocked(addr: usize) -> bool {
-    TRUNK_ADDR_TABLE
-        .lock()
-        .unwrap()
-        .get_mut()
-        .contains_key(&addr)
 }
 
 fn read_memory(addr: usize, len: usize) -> Vec<u8> {
