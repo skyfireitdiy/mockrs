@@ -32,7 +32,6 @@ use std::{
     num::NonZeroUsize,
     ptr::NonNull,
     sync::{Mutex, MutexGuard},
-    thread::ThreadId,
 };
 
 use iced_x86::{Decoder, DecoderOptions, Encoder, Instruction, Register};
@@ -76,13 +75,9 @@ impl Default for InstrPosition {
 
 static CURRENT_POSITION: Mutex<Cell<usize>> = Mutex::new(Cell::new(0));
 
-lazy_static! {
-    static ref THREAD_REPLACE_TABLE: Mutex<HashMap<ThreadId, RefCell<HashMap<usize, Vec<usize>>>>> =
-        Mutex::new(HashMap::new());
-}
-
 thread_local! {
     static CURRENT_REPLACE: Cell<InstrPosition> = const { Cell::new(InstrPosition{orig_addr: 0, trunk_addr: 0,old_len:0, new_len:0, replace_reg: Register::None as u8, replace_data: 0}) };
+    static THREAD_REPLACE_TABLE: RefCell<HashMap<usize, Vec<usize>>> = RefCell::new(HashMap::new());
 }
 
 fn disassemble_instruction(ins: &[u8], addr: u64) -> Option<Instruction> {
@@ -200,44 +195,12 @@ fn set_ip_register(ctx: *mut ucontext_t, new_func_addr: usize) {
     unsafe { (*ctx).uc_mcontext.gregs[REG_RIP as usize] = new_func_addr as i64 };
 }
 
-macro_rules! read_thread_local {
-    ($name:expr) => {
-        $name.lock().unwrap().get(&std::thread::current().id())
-    };
-}
-
-macro_rules! create_thread_local {
-    ($name:expr, $value:expr) => {
-        if $name
-            .lock()
-            .unwrap()
-            .get(&std::thread::current().id())
-            .is_none()
-        {
-            $name
-                .lock()
-                .unwrap()
-                .insert(std::thread::current().id(), $value);
-        }
-    };
-}
-
 fn get_new_func_addr(old_func: usize) -> usize {
-    *read_thread_local!(THREAD_REPLACE_TABLE)
-        .unwrap()
-        .borrow_mut()
-        .get(&old_func)
-        .unwrap()
-        .last()
-        .unwrap()
+    THREAD_REPLACE_TABLE.with(|x| x.borrow().get(&old_func).unwrap().last().unwrap().clone())
 }
 
 fn is_current_thread_mocked(old_func: usize) -> bool {
-    if let Some(thread_info) = read_thread_local!(THREAD_REPLACE_TABLE) {
-        thread_info.borrow().get(&old_func).is_some()
-    } else {
-        false
-    }
+    THREAD_REPLACE_TABLE.with(|x| x.borrow().get(&old_func).is_some())
 }
 
 impl X8664Mocker {
@@ -286,32 +249,21 @@ impl X8664Mocker {
                     save_old_instruction(&ins, current_position);
                     set_mem_writable(old_func, 1);
                     write_memory(old_func, [0xcc].as_slice());
-                // 不去除内存的可写权限，因为在并法同时给一个函数进行mock的时候会有问题
+                    // 不去除内存的可写权限，因为在并法同时给一个函数进行mock的时候会有问题
                 } else {
                     panic!("Failed to disassemble instruction at 0x{:x}", old_func);
                 }
             }
         }
 
-        create_thread_local!(THREAD_REPLACE_TABLE, RefCell::new(HashMap::new()));
-        if read_thread_local!(THREAD_REPLACE_TABLE)
-            .unwrap()
-            .borrow()
-            .get(&old_func)
-            .is_some()
-        {
-            read_thread_local!(THREAD_REPLACE_TABLE)
-                .unwrap()
-                .borrow_mut()
-                .get_mut(&old_func)
-                .unwrap()
-                .push(new_func);
-        } else {
-            read_thread_local!(THREAD_REPLACE_TABLE)
-                .unwrap()
-                .borrow_mut()
-                .insert(old_func, vec![new_func]);
-        }
+        THREAD_REPLACE_TABLE.with(|x| {
+            let mut x = x.borrow_mut();
+            if let Some(v) = x.get_mut(&old_func) {
+                v.push(new_func);
+            } else {
+                x.insert(old_func, vec![new_func]);
+            }
+        });
 
         X8664Mocker { old_func, new_func }
     }
@@ -440,24 +392,15 @@ fn set_mem_writable(old_func: usize, len: usize) {
 
 impl Drop for X8664Mocker {
     fn drop(&mut self) {
-        read_thread_local!(THREAD_REPLACE_TABLE)
-            .unwrap()
-            .borrow_mut()
-            .get_mut(&self.old_func)
-            .unwrap()
-            .retain(|&new_func| new_func != self.new_func);
-        if read_thread_local!(THREAD_REPLACE_TABLE)
-            .unwrap()
-            .borrow()
-            .get(&self.old_func)
-            .unwrap()
-            .is_empty()
-        {
-            read_thread_local!(THREAD_REPLACE_TABLE)
+        THREAD_REPLACE_TABLE.with(|x| {
+            let mut x = x.borrow_mut();
+            x.get_mut(&self.old_func)
                 .unwrap()
-                .borrow_mut()
-                .remove(&self.old_func);
-        }
+                .retain(|&new_func| new_func != self.new_func);
+            if x.get(&self.old_func).unwrap().is_empty() {
+                x.remove(&self.old_func);
+            }
+        });
     }
 }
 
