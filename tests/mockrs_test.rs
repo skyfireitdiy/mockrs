@@ -24,6 +24,7 @@ mod mockrs_tests {
         // Assert that the original function returns the expected value in both threads
         assert_eq!(thread1.join().unwrap(), 42);
         assert_eq!(thread2.join().unwrap(), 42);
+        assert_eq!(original_function(), 100);
 
         // Drop the mocker to restore the original function
         drop(mocker);
@@ -61,6 +62,9 @@ mod mockrs_tests {
         // Assert that the original functions return the expected values
         assert_eq!(original_function1(), 100);
         assert_eq!(original_function2(), 2.71);
+
+        assert_eq!(thread::spawn(original_function1).join().unwrap(), 42);
+        assert_eq!(thread::spawn(original_function2).join().unwrap(), 3.14);
 
         // Drop the mockers to restore the original functions
         drop(mocker1);
@@ -100,6 +104,9 @@ mod mockrs_tests {
         assert_eq!(original_function1(), 100);
         assert_eq!(original_function2(), 200);
 
+        assert_eq!(thread::spawn(original_function1).join().unwrap(), 42);
+        assert_eq!(thread::spawn(original_function2).join().unwrap(), 42);
+
         // Drop the mockers to restore the original functions
         drop(mocker2);
         drop(mocker1);
@@ -133,12 +140,19 @@ mod mockrs_tests {
         // Assert that the original function returns the expected values
         assert_eq!(original_function(), 200);
 
+        assert_eq!(thread::spawn(original_function).join().unwrap(), 42);
+
         // Drop the mockers to restore the original function
         drop(mocker2);
+
+        assert_eq!(original_function(), 100);
+        assert_eq!(thread::spawn(original_function).join().unwrap(), 42);
+
         drop(mocker1);
 
         // Assert that the original function returns the expected value after dropping the mockers
         assert_eq!(original_function(), 42);
+        assert_eq!(thread::spawn(original_function).join().unwrap(), 42);
     }
 
     #[test]
