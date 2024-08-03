@@ -138,15 +138,12 @@ extern "C" fn handle_trap_signal(_: i32, _: *mut siginfo_t, ucontext: *mut c_voi
             enter_step_mode(ctx);
             let trunk_addr = get_bak_instruction_addr(orig_addr);
             let mut patch = InstrPosition::default();
-            CURRENT_REPLACE.with(|x| {
-                patch.orig_addr = orig_addr;
-                patch.trunk_addr = trunk_addr;
-                let buf = read_memory(trunk_addr, 3);
-                patch.old_len = buf[0];
-                patch.new_len = buf[1];
-                patch.replace_reg = buf[2];
-                x.set(patch);
-            });
+            patch.orig_addr = orig_addr;
+            patch.trunk_addr = trunk_addr;
+            let buf = read_memory(trunk_addr, 3);
+            patch.old_len = buf[0];
+            patch.new_len = buf[1];
+            patch.replace_reg = buf[2];
             let r = get_context_reg_index(patch.replace_reg);
 
             if r != -1 {
@@ -155,7 +152,7 @@ extern "C" fn handle_trap_signal(_: i32, _: *mut siginfo_t, ucontext: *mut c_voi
                     (*ctx).uc_mcontext.gregs[r as usize] = orig_addr as i64 + patch.old_len as i64;
                 };
             }
-
+            CURRENT_REPLACE.with(|x| x.set(patch));
             set_ip_register(ctx, trunk_addr + 3);
         }
     } else {
