@@ -305,6 +305,10 @@ fn save_old_instruction(ins: &Instruction, current_position: MutexGuard<Cell<usi
     let mut encoder = Encoder::new(64);
     match encoder.encode(&new_instruction, ins.ip()) {
         Ok(new_len) => {
+            if current_position.get() + 3 + new_len >= get_code_area_size() {
+                panic!("Code area overflow");
+            }
+
             write_memory(current_position.get(), &[old_len as u8]);
             current_position.set(current_position.get() + 1);
 
