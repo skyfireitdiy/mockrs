@@ -345,11 +345,17 @@ fn init_mock() {
     });
 }
 
+fn get_code_area_size() -> usize {
+    std::env::var("MOCKRS_CODE_AREA_SIZE")
+        .map(|x| x.parse::<usize>().unwrap())
+        .unwrap_or(0x8000)
+}
+
 fn alloc_code_area() {
     unsafe {
         let code_area = mmap_anonymous(
             None,
-            NonZeroUsize::new(0x8000).unwrap(),
+            NonZeroUsize::new(get_code_area_size()).unwrap(),
             ProtFlags::PROT_READ | ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC,
             MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
         )

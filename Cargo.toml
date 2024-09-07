@@ -1,6 +1,6 @@
 [package]
 name = "mockrs"
-version = "0.1.9"
+version = "1.0.0"
 edition = "2021"
 authors = ["skyfire <skyfireitdiy@hotmail.com>"]
 description = "A crate that provides a X8664Mocker to mock function calls and intercept on x86_64 architecture."
