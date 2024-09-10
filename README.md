@@ -1,5 +1,7 @@
 # mockrs Crate Documentation
 
+![Rust Test Status](https://github.com/skyfireitdiy/mockrs/actions/workflows/rust.yml/badge.svg)
+
 ## Overview
 
 The `mockrs` crate provides a powerful tool for function mocking and interception in Rust, specifically designed for the x86_64 architecture. This utility is particularly useful for testing and debugging purposes, where you need to replace the behavior of a function temporarily.
