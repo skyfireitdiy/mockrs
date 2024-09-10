@@ -1,6 +1,7 @@
 # mockrs Crate Documentation
 
 ![Rust Test Status](https://github.com/skyfireitdiy/mockrs/actions/workflows/rust.yml/badge.svg)
+![Crate.io Release](https://img.shields.io/crates/v/mockrs.svg)
 
 ## Overview
 
