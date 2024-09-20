@@ -51,6 +51,7 @@ static G_INIT_FLAG: Mutex<OnceCell<()>> = Mutex::new(OnceCell::new());
 static G_CODE_AREA: Mutex<RefCell<usize>> = Mutex::new(RefCell::new(0));
 
 const PAGE_SIZE: usize = 4096;
+const DEFAULT_CODE_AREA_SIZE: usize = 8 * PAGE_SIZE;
 
 #[derive(Clone, Copy)]
 struct InstrPosition {
@@ -372,7 +373,7 @@ fn init_mock() {
 fn get_code_area_size() -> usize {
     std::env::var("MOCKRS_CODE_AREA_SIZE_IN_PAGE")
         .map(|x| x.parse::<usize>().unwrap() * PAGE_SIZE)
-        .unwrap_or(0x8000)
+        .unwrap_or(DEFAULT_CODE_AREA_SIZE)
 }
 
 fn alloc_code_area() {
