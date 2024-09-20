@@ -42,13 +42,13 @@ pub struct X8664Mocker {
 }
 
 lazy_static! {
-    static ref TRUNK_ADDR_TABLE: Mutex<RefCell<HashMap<usize, usize>>> =
+    static ref G_TRUNK_ADDR_TABLE: Mutex<RefCell<HashMap<usize, usize>>> =
         Mutex::new(RefCell::new(HashMap::new()));
 }
-static REPLACE_LEN: usize = 16;
-static INIT_FLAG: Mutex<OnceCell<()>> = Mutex::new(OnceCell::new());
+static G_REPLACE_LEN: usize = 16;
+static G_INIT_FLAG: Mutex<OnceCell<()>> = Mutex::new(OnceCell::new());
 
-static CODE_AREA: Mutex<RefCell<usize>> = Mutex::new(RefCell::new(0));
+static G_CODE_AREA: Mutex<RefCell<usize>> = Mutex::new(RefCell::new(0));
 
 #[derive(Clone, Copy)]
 struct InstrPosition {
@@ -73,11 +73,27 @@ impl Default for InstrPosition {
     }
 }
 
-static CURRENT_POSITION: Mutex<Cell<usize>> = Mutex::new(Cell::new(0));
+struct Droper {}
+
+#[allow(dead_code)]
+static G_DROPER: Droper = Droper {};
+
+impl Drop for Droper {
+    fn drop(&mut self) {
+        let code_area: usize = *G_CODE_AREA.lock().unwrap().get_mut();
+        if code_area != 0 {
+            unsafe {
+                munmap(code_area as *mut c_void, get_code_area_size());
+            }
+        }
+    }
+}
+
+static G_CURRENT_POSITION: Mutex<Cell<usize>> = Mutex::new(Cell::new(0));
 
 thread_local! {
-    static CURRENT_REPLACE: Cell<InstrPosition> = const { Cell::new(InstrPosition{orig_addr: 0, trunk_addr: 0,old_len:0, new_len:0, replace_reg: Register::None as u8, replace_data: 0}) };
-    static THREAD_REPLACE_TABLE: RefCell<HashMap<usize, Vec<usize>>> = RefCell::new(HashMap::new());
+    static G_CURRENT_REPLACE: Cell<InstrPosition> = const { Cell::new(InstrPosition{orig_addr: 0, trunk_addr: 0,old_len:0, new_len:0, replace_reg: Register::None as u8, replace_data: 0}) };
+    static G_THREAD_REPLACE_TABLE: RefCell<HashMap<usize, Vec<usize>>> = RefCell::new(HashMap::new());
 }
 
 fn disassemble_instruction(ins: &[u8], addr: u64) -> Option<Instruction> {
@@ -152,7 +168,7 @@ extern "C" fn handle_trap_signal(_: i32, _: *mut siginfo_t, ucontext: *mut c_voi
                     (*ctx).uc_mcontext.gregs[r as usize] = orig_addr as i64 + patch.old_len as i64;
                 };
             }
-            CURRENT_REPLACE.with(|x| x.set(patch));
+            G_CURRENT_REPLACE.with(|x| x.set(patch));
             set_ip_register(ctx, trunk_addr + 3);
         }
     } else {
@@ -164,7 +180,7 @@ extern "C" fn handle_trap_signal(_: i32, _: *mut siginfo_t, ucontext: *mut c_voi
             new_len,
             replace_reg,
             replace_data,
-        } = CURRENT_REPLACE.with(|x| x.get());
+        } = G_CURRENT_REPLACE.with(|x| x.get());
 
         let r = get_context_reg_index(replace_reg);
 
@@ -180,7 +196,7 @@ extern "C" fn handle_trap_signal(_: i32, _: *mut siginfo_t, ucontext: *mut c_voi
 }
 
 fn get_bak_instruction_addr(old_func: usize) -> usize {
-    *TRUNK_ADDR_TABLE
+    *G_TRUNK_ADDR_TABLE
         .lock()
         .unwrap()
         .get_mut()
@@ -193,11 +209,11 @@ fn set_ip_register(ctx: *mut ucontext_t, new_func_addr: usize) {
 }
 
 fn get_new_func_addr(old_func: usize) -> usize {
-    THREAD_REPLACE_TABLE.with(|x| x.borrow().get(&old_func).unwrap().last().unwrap().clone())
+    G_THREAD_REPLACE_TABLE.with(|x| x.borrow().get(&old_func).unwrap().last().unwrap().clone())
 }
 
 fn is_current_thread_mocked(old_func: usize) -> bool {
-    THREAD_REPLACE_TABLE.with(|x| x.borrow().get(&old_func).is_some())
+    G_THREAD_REPLACE_TABLE.with(|x| x.borrow().get(&old_func).is_some())
 }
 
 impl X8664Mocker {
@@ -234,12 +250,12 @@ impl X8664Mocker {
         init_mock();
 
         {
-            let mut addr_table = TRUNK_ADDR_TABLE.lock().unwrap();
+            let mut addr_table = G_TRUNK_ADDR_TABLE.lock().unwrap();
             if addr_table.get_mut().get(&old_func).is_none() {
-                let ins_mem = read_memory(old_func, REPLACE_LEN).clone();
+                let ins_mem = read_memory(old_func, G_REPLACE_LEN).clone();
 
                 if let Some(ins) = disassemble_instruction(&ins_mem, old_func as u64) {
-                    let current_position = CURRENT_POSITION.lock().unwrap();
+                    let current_position = G_CURRENT_POSITION.lock().unwrap();
                     addr_table
                         .get_mut()
                         .insert(old_func, current_position.get());
@@ -253,7 +269,7 @@ impl X8664Mocker {
             }
         }
 
-        THREAD_REPLACE_TABLE.with(|x| {
+        G_THREAD_REPLACE_TABLE.with(|x| {
             let mut x = x.borrow_mut();
             if let Some(v) = x.get_mut(&old_func) {
                 v.push(new_func);
@@ -305,7 +321,7 @@ fn save_old_instruction(ins: &Instruction, current_position: MutexGuard<Cell<usi
     let mut encoder = Encoder::new(64);
     match encoder.encode(&new_instruction, ins.ip()) {
         Ok(new_len) => {
-            if current_position.get() + 3 + new_len - *CODE_AREA.lock().unwrap().get_mut()
+            if current_position.get() + 3 + new_len - *G_CODE_AREA.lock().unwrap().get_mut()
                 >= get_code_area_size()
             {
                 panic!("Code area overflow");
@@ -345,7 +361,7 @@ fn write_memory(addr: usize, data: &[u8]) {
 }
 
 fn init_mock() {
-    INIT_FLAG.lock().unwrap().get_or_init(|| {
+    G_INIT_FLAG.lock().unwrap().get_or_init(|| {
         setup_trap_handler();
         alloc_code_area();
     });
@@ -367,8 +383,11 @@ fn alloc_code_area() {
         )
         .unwrap()
         .as_ptr();
-        *CODE_AREA.lock().unwrap().get_mut() = code_area as usize;
-        CURRENT_POSITION.lock().unwrap().replace(code_area as usize);
+        *G_CODE_AREA.lock().unwrap().get_mut() = code_area as usize;
+        G_CURRENT_POSITION
+            .lock()
+            .unwrap()
+            .replace(code_area as usize);
     }
 }
 
@@ -401,7 +420,7 @@ fn set_mem_writable(old_func: usize, len: usize) {
 
 impl Drop for X8664Mocker {
     fn drop(&mut self) {
-        THREAD_REPLACE_TABLE.with(|x| {
+        G_THREAD_REPLACE_TABLE.with(|x| {
             let mut x = x.borrow_mut();
             x.get_mut(&self.old_func)
                 .unwrap()
