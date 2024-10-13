@@ -18,6 +18,7 @@ use std::{
 
 use iced_x86::{Decoder, DecoderOptions, Encoder, Instruction, Register};
 
+/// `X8664Mocker`结构体，用于模拟函数
 pub struct X8664Mocker {
     old_func: usize,
     new_func: usize,
@@ -35,6 +36,7 @@ static G_CODE_AREA: Mutex<RefCell<usize>> = Mutex::new(RefCell::new(0));
 const PAGE_SIZE: usize = 4096;
 const DEFAULT_CODE_AREA_SIZE: usize = 8 * PAGE_SIZE;
 
+/// `InstrPosition`结构体，用于存储指令位置
 #[derive(Clone, Copy)]
 struct InstrPosition {
     orig_addr: usize,
@@ -58,6 +60,7 @@ impl Default for InstrPosition {
     }
 }
 
+/// `Droper`结构体，用于释放资源
 struct Droper {}
 
 #[allow(dead_code)]
@@ -81,6 +84,7 @@ thread_local! {
     static G_THREAD_REPLACE_TABLE: RefCell<HashMap<usize, Vec<usize>>> = RefCell::new(HashMap::new());
 }
 
+/// 解析指令
 fn disassemble_instruction(ins: &[u8], addr: u64) -> Option<Instruction> {
     let mut decoder = Decoder::with_ip(64, ins, addr, DecoderOptions::NONE);
     let mut instruction = Instruction::default();
@@ -92,22 +96,27 @@ fn disassemble_instruction(ins: &[u8], addr: u64) -> Option<Instruction> {
     }
 }
 
+/// 获取页面边界
 fn get_page_bound(addr: usize, len: usize) -> (usize, usize) {
     (addr & 0xfffffffff000, (addr + len + 0xfff) & 0xfffffffff000)
 }
 
+/// 判断是否为步进模式
 fn is_step_mode(eflags: i64) -> bool {
     eflags & 0x100 != 0
 }
 
+/// 进入步进模式
 fn enter_step_mode(ctx: *mut ucontext_t) {
     unsafe { (*ctx).uc_mcontext.gregs[REG_EFL as usize] |= 0x100 };
 }
 
+/// 离开步进模式
 fn leave_step_mode(ctx: *mut ucontext_t) {
     unsafe { (*ctx).uc_mcontext.gregs[REG_EFL as usize] &= !0x100 };
 }
 
+/// 获取上下文寄存器索引
 fn get_context_reg_index(reg: u8) -> i32 {
     if reg == Register::RAX as u8 {
         return REG_RAX;
@@ -125,6 +134,7 @@ fn get_context_reg_index(reg: u8) -> i32 {
     return -1;
 }
 
+/// 处理陷阱信号
 extern "C" fn handle_trap_signal(_: i32, _: *mut siginfo_t, ucontext: *mut c_void) {
     let ctx = ucontext as *mut ucontext_t;
     let rip = unsafe { (*ctx).uc_mcontext.gregs[REG_RIP as usize] as usize };
@@ -180,6 +190,7 @@ extern "C" fn handle_trap_signal(_: i32, _: *mut siginfo_t, ucontext: *mut c_voi
     }
 }
 
+/// 获取备份指令地址
 fn get_bak_instruction_addr(old_func: usize) -> usize {
     *G_TRUNK_ADDR_TABLE
         .lock()
@@ -189,31 +200,34 @@ fn get_bak_instruction_addr(old_func: usize) -> usize {
         .unwrap()
 }
 
+/// 设置指令指针寄存器
 fn set_ip_register(ctx: *mut ucontext_t, new_func_addr: usize) {
     unsafe { (*ctx).uc_mcontext.gregs[REG_RIP as usize] = new_func_addr as i64 };
 }
 
+/// 获取新函数地址
 fn get_new_func_addr(old_func: usize) -> usize {
     G_THREAD_REPLACE_TABLE.with(|x| x.borrow().get(&old_func).unwrap().last().unwrap().clone())
 }
 
+/// 判断当前线程是否被模拟
 fn is_current_thread_mocked(old_func: usize) -> bool {
     G_THREAD_REPLACE_TABLE.with(|x| x.borrow().get(&old_func).is_some())
 }
 
 impl X8664Mocker {
-    /// Creates a new instance of `X8664Mocker` for mocking a function.
+    /// 创建一个新的`X8664Mocker`实例，用于模拟函数。
     ///
-    /// # Arguments
+    /// # 参数
     ///
-    /// * `old_func` - The address of the original function to be mocked.
-    /// * `new_func` - The address of the new function to replace the original function.
+    /// * `old_func` - 要模拟的原始函数的地址。
+    /// * `new_func` - 要替换原始函数的新函数的地址。
     ///
-    /// # Returns
+    /// # 返回
     ///
-    /// A new instance of `X8664Mocker` that can be used to mock the function.
+    /// 可用于模拟函数的`X8664Mocker`的新实例。
     ///
-    /// # Example
+    /// # 示例
     ///
     /// ```
     /// use mockrs::mock;
@@ -267,6 +281,7 @@ impl X8664Mocker {
     }
 }
 
+/// 获取替换寄存器
 fn get_replace_register(ins: &Instruction) -> Register {
     let regs: Vec<Register> = (0..=4u32).map(|i| ins.op_register(i)).collect();
     *[
@@ -282,6 +297,7 @@ fn get_replace_register(ins: &Instruction) -> Register {
     .unwrap()
 }
 
+/// 生成新指令
 fn make_new_instruction(ins: Instruction, reg: Register) -> Instruction {
     let mut bak_ins = ins.clone();
     if bak_ins.memory_base().is_ip() {
@@ -293,6 +309,7 @@ fn make_new_instruction(ins: Instruction, reg: Register) -> Instruction {
     bak_ins
 }
 
+/// 保存旧指令
 fn save_old_instruction(ins: &Instruction, current_position: MutexGuard<Cell<usize>>) {
     let old_len = ins.len();
     let mut replace_reg = Register::None;
@@ -331,6 +348,7 @@ fn save_old_instruction(ins: &Instruction, current_position: MutexGuard<Cell<usi
     }
 }
 
+/// 读取内存
 fn read_memory(addr: usize, len: usize) -> Vec<u8> {
     let mut buf = vec![0u8; len];
     unsafe {
@@ -339,12 +357,14 @@ fn read_memory(addr: usize, len: usize) -> Vec<u8> {
     buf
 }
 
+/// 写入内存
 fn write_memory(addr: usize, data: &[u8]) {
     unsafe {
         std::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, data.len());
     }
 }
 
+/// 初始化模拟
 fn init_mock() {
     G_INIT_FLAG.lock().unwrap().get_or_init(|| {
         setup_trap_handler();
@@ -352,12 +372,14 @@ fn init_mock() {
     });
 }
 
+/// 获取代码区域大小
 fn get_code_area_size() -> usize {
     std::env::var("MOCKRS_CODE_AREA_SIZE_IN_PAGE")
         .map(|x| x.parse::<usize>().unwrap() * PAGE_SIZE)
         .unwrap_or(DEFAULT_CODE_AREA_SIZE)
 }
 
+/// 分配代码区域
 fn alloc_code_area() {
     unsafe {
         let code_area = mmap_anonymous(
@@ -376,6 +398,7 @@ fn alloc_code_area() {
     }
 }
 
+/// 设置陷阱处理程序
 fn setup_trap_handler() {
     if let Err(err) = unsafe {
         sigaction(
@@ -391,6 +414,7 @@ fn setup_trap_handler() {
     }
 }
 
+/// 设置内存可写
 fn set_mem_writable(old_func: usize, len: usize) {
     let (low, high) = get_page_bound(old_func, len);
     unsafe {
@@ -417,18 +441,18 @@ impl Drop for X8664Mocker {
     }
 }
 
-/// A macro to create a new instance of `X8664Mocker` for mocking a function.
+/// 用于创建`X8664Mocker`实例的宏
 ///
-/// # Arguments
+/// # 参数
 ///
-/// * `$old_func`: The name of the original function to be mocked. This should be a function name without parentheses.
-/// * `$new_func`: The name of the new function to replace the original function. This should be a function name without parentheses.
+/// * `$old_func`: 要模拟的原始函数的名称。这应该是一个不带括号的函数名称。
+/// * `$new_func`: 要替换原始函数的新函数的名称。这应该是一个不带括号的函数名称。
 ///
-/// # Returns
+/// # 返回
 ///
-/// A new instance of `X8664Mocker` that can be used to mock the function.
+/// 可用于模拟函数的`X8664Mocker`的新实例。
 ///
-/// # Example
+/// # 示例
 ///
 /// ```rust
 /// use mockrs::mock;
@@ -447,7 +471,7 @@ impl Drop for X8664Mocker {
 /// }
 /// ```
 ///
-/// Note: This macro is only available when targeting the x86_64 architecture.
+/// 注意：此宏仅在目标架构为x86_64时可用。
 #[macro_export]
 #[cfg(target_arch = "x86_64")]
 macro_rules! mock {
