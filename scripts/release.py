@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 A script to handle version bumping, committing, and tagging.
 """
@@ -43,6 +44,10 @@ def main():
         print("Usage: python scripts/release.py [major|minor|patch]")
         sys.exit(1)
 
+    print("Running tests...")
+    subprocess.run(["cargo", "test"], check=True)
+    print("Tests passed.")
+
     bump_type = sys.argv[1]
 
     major, minor, patch = get_current_version()
@@ -60,15 +65,24 @@ def main():
     new_version_str = update_cargo_toml([major, minor, patch])
     print(f"Version bumped to {new_version_str}")
 
+    # Run cargo check to update Cargo.lock without a full build
+    print("Updating Cargo.lock...")
+    subprocess.run(["cargo", "check"], check=True)
+
     commit_message = f"chore(release): v{new_version_str}"
     tag_name = f"v{new_version_str}"
 
-    subprocess.run(["git", "add", "Cargo.toml"], check=True)
+    subprocess.run(["git", "add", "Cargo.toml", "Cargo.lock"], check=True)
     subprocess.run(["git", "commit", "-m", commit_message], check=True)
     print(f"Committed with message: '{commit_message}'")
 
     subprocess.run(["git", "tag", tag_name], check=True)
     print(f"Created tag: '{tag_name}'")
+
+    print("Pushing changes to remote...")
+    subprocess.run(["git", "push"], check=True)
+    subprocess.run(["git", "push", "origin", tag_name], check=True)
+    print("Push successful.")
 
 
 if __name__ == "__main__":

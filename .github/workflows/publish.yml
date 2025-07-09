@@ -16,7 +16,9 @@ jobs:
         with:
           toolchain: stable
           override: true
+      - name: Build project
+        run: cargo build --verbose
       - name: Publish to crates.io
-        run: cargo publish
+        run: cargo publish --allow-dirty
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}
