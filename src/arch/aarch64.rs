@@ -61,7 +61,6 @@ thread_local! {
 extern "C" fn handle_trap_signal(_: i32, _info: *mut siginfo_t, ucontext: *mut c_void) {
     let ctx = ucontext as *mut ucontext_t;
     let trap_addr = unsafe { (*ctx).uc_mcontext.pc as usize };
-    println!("[mockrs] handle_trap_signal: received trap at 0x{trap_addr:x}");
 
     let trunk_addr_option = G_TRUNK_ADDR_TABLE
         .lock()
@@ -74,15 +73,11 @@ extern "C" fn handle_trap_signal(_: i32, _info: *mut siginfo_t, ucontext: *mut c
         // This is a trap from one of our hooked functions.
         if is_current_thread_mocked(trap_addr) {
             let new_func_addr = get_new_func_addr(trap_addr);
-            println!(
-                "[mockrs] handle_trap_signal: address is mocked, redirecting to 0x{new_func_addr:x}"
-            );
             unsafe {
                 (*ctx).uc_mcontext.pc = new_func_addr as u64;
             }
         } else {
             // Not mocked for this thread, so execute original instruction from trunk.
-            println!("[mockrs] handle_trap_signal: address is not mocked for this thread, executing original code from trunk at 0x{trunk_addr:x}");
             unsafe {
                 (*ctx).uc_mcontext.pc = trunk_addr as u64;
             }
@@ -91,7 +86,6 @@ extern "C" fn handle_trap_signal(_: i32, _info: *mut siginfo_t, ucontext: *mut c
         // This is not a trap from one of our hooks.
         // To avoid an infinite loop, we advance PC past the trapping instruction.
         // This assumes the unknown trap instruction is 4 bytes long.
-        println!("[mockrs] handle_trap_signal: address is not hooked, advancing PC");
         unsafe {
             (*ctx).uc_mcontext.pc += 4;
         }
@@ -106,31 +100,26 @@ fn get_bak_instruction_addr(old_func: usize) -> usize {
         .borrow()
         .get(&old_func)
         .unwrap();
-    println!("[mockrs] get_bak_instruction_addr: for 0x{old_func:x} -> 0x{addr:x}");
     addr
 }
 
 fn get_new_func_addr(old_func: usize) -> usize {
     let addr = G_THREAD_REPLACE_TABLE.with(|x| *x.borrow().get(&old_func).unwrap().last().unwrap());
-    println!("[mockrs] get_new_func_addr: for 0x{old_func:x} -> 0x{addr:x}");
     addr
 }
 
 fn is_current_thread_mocked(old_func: usize) -> bool {
     let result = G_THREAD_REPLACE_TABLE.with(|x| x.borrow().get(&old_func).is_some());
-    println!("[mockrs] is_current_thread_mocked: for 0x{old_func:x} -> {result}");
     result
 }
 
 impl Mocker {
     pub fn mock(old_func: usize, new_func: usize) -> Mocker {
-        println!("[mockrs] Mocker::mock: old_func=0x{old_func:x}, new_func=0x{new_func:x}");
         init_mock();
 
         {
             let mut addr_table = G_TRUNK_ADDR_TABLE.lock().unwrap();
             if addr_table.borrow().get(&old_func).is_none() {
-                println!("[mockrs] Mocker::mock: no existing trunk for this function, creating one");
                 let ins_mem = read_memory(old_func, G_REPLACE_LEN).clone();
                 let cs = Capstone::new()
                     .arm64()
@@ -144,12 +133,10 @@ impl Mocker {
                 if let Ok(insns) = disasm_result {
                     if !insns.is_empty() {
                         let ins = &insns.as_ref()[0];
-                        println!("[mockrs] Mocker::mock: first instruction to save: {ins}");
                         let current_position = G_CURRENT_POSITION.lock().unwrap();
                         let trunk_addr = save_old_instruction(&cs, ins, current_position);
                         addr_table.get_mut().insert(old_func, trunk_addr);
                         set_mem_writable(old_func, 4);
-                        println!("[mockrs] Mocker::mock: writing brk #0 to 0x{old_func:x}");
                         // brk #0
                         write_memory(old_func, &[0x00, 0x00, 0x20, 0xd4]);
                     } else {
@@ -179,7 +166,6 @@ fn save_old_instruction(
     ins: &Insn,
     current_position: MutexGuard<Cell<usize>>,
 ) -> usize {
-    println!("[mockrs] save_old_instruction: saving instruction {ins}");
     let detail = cs.insn_detail(ins).unwrap();
     let is_branch = detail.groups().iter().any(|&group| {
         u32::from(group.0) == capstone::arch::arm64::Arm64InsnGroup::ARM64_GRP_BRANCH_RELATIVE
@@ -197,7 +183,6 @@ fn save_old_instruction(
     let jump_back_len = 16; // 4 (ldr) + 4 (br) + 8 (addr)
 
     let mut pos = current_position.get();
-    println!("[mockrs] save_old_instruction: current_pos_val=0x{pos:x}");
     if pos + 3 + new_len + jump_back_len - *G_CODE_AREA.lock().unwrap().get_mut()
         >= get_code_area_size()
     {
@@ -219,7 +204,6 @@ fn save_old_instruction(
     let mut ins_bytes = ins.bytes().to_vec();
 
     if ins.id() == InsnId(arm64::Arm64Insn::ARM64_INS_ADRP as u32) {
-        println!("[mockrs] save_old_instruction: relocating ADRP instruction");
         let detail = cs.insn_detail(ins).unwrap();
         let arch_detail = detail.arch_detail();
         let ops = arch_detail.operands();
@@ -244,7 +228,6 @@ fn save_old_instruction(
 
         if (-(1 << 20)..(1 << 20)).contains(&imm21) {
             // Offset is in range, re-encode the instruction
-            println!("[mockrs] save_old_instruction: ADRP offset 0x{offset:x} is in range");
             let immlo = (imm21 & 0x3) as u32;
             let immhi = ((imm21 >> 2) & 0x7FFFF) as u32;
 
@@ -256,7 +239,6 @@ fn save_old_instruction(
             ins_bytes = ins_word.to_le_bytes().to_vec();
         } else {
             // Offset is out of range, generate a new instruction sequence
-            println!("[mockrs] save_old_instruction: ADRP offset 0x{offset:x} out of range, generating LDR literal sequence");
             let ins_word = u32::from_le_bytes(ins_bytes.as_slice().try_into().unwrap());
             let rd_idx = ins_word & 0x1F;
             // LDR Xd, #8
@@ -289,7 +271,6 @@ fn save_old_instruction(
     pos += 8;
 
     current_position.set(pos);
-    println!("[mockrs] save_old_instruction: new_pos=0x{:x}", current_position.get());
 
     trunk_addr
 }
@@ -382,7 +363,10 @@ fn setup_trap_handler() {
 }
 
 fn get_page_bound(addr: usize, len: usize) -> (usize, usize) {
-    (addr & !(PAGE_SIZE - 1), (addr + len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1))
+    (
+        addr & !(PAGE_SIZE - 1),
+        (addr + len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1),
+    )
 }
 
 fn set_mem_writable(old_func: usize, len: usize) {
