@@ -58,9 +58,9 @@ thread_local! {
     static G_THREAD_REPLACE_TABLE: RefCell<HashMap<usize, Vec<usize>>> = RefCell::new(HashMap::new());
 }
 
-extern "C" fn handle_trap_signal(_: i32, info: *mut siginfo_t, ucontext: *mut c_void) {
-    let trap_addr = unsafe { (*info).si_addr() } as usize;
+extern "C" fn handle_trap_signal(_: i32, _info: *mut siginfo_t, ucontext: *mut c_void) {
     let ctx = ucontext as *mut ucontext_t;
+    let trap_addr = unsafe { (*ctx).uc_mcontext.pc as usize };
     println!("[mockrs] handle_trap_signal: received trap at 0x{:x}", trap_addr);
 
     if is_current_thread_mocked(trap_addr) {
@@ -306,10 +306,14 @@ impl Drop for Mocker {
     fn drop(&mut self) {
         G_THREAD_REPLACE_TABLE.with(|x| {
             let mut x = x.borrow_mut();
-            x.get_mut(&self.old_func)
-                .unwrap()
-                .retain(|&new_func| new_func != self.new_func);
-            if x.get(&self.old_func).unwrap().is_empty() {
+            let mut should_remove = false;
+            if let Some(v) = x.get_mut(&self.old_func) {
+                v.retain(|&new_func| new_func != self.new_func);
+                if v.is_empty() {
+                    should_remove = true;
+                }
+            }
+            if should_remove {
                 x.remove(&self.old_func);
             }
         });
