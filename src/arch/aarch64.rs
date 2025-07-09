@@ -1,5 +1,5 @@
 use capstone::arch::{arm64, BuildsCapstone, BuildsCapstoneEndian};
-use capstone::{Capstone, Endian, Insn};
+use capstone::{Capstone, Endian, Insn, InsnId};
 use lazy_static::lazy_static;
 use nix::{
     libc::*,
@@ -63,16 +63,36 @@ extern "C" fn handle_trap_signal(_: i32, _info: *mut siginfo_t, ucontext: *mut c
     let trap_addr = unsafe { (*ctx).uc_mcontext.pc as usize };
     println!("[mockrs] handle_trap_signal: received trap at 0x{:x}", trap_addr);
 
-    if is_current_thread_mocked(trap_addr) {
-        let new_func_addr = get_new_func_addr(trap_addr);
-        println!("[mockrs] handle_trap_signal: address is mocked, redirecting to 0x{:x}", new_func_addr);
-        unsafe {
-            (*ctx).uc_mcontext.pc = new_func_addr as u64;
+    let trunk_addr_option = G_TRUNK_ADDR_TABLE
+        .lock()
+        .unwrap()
+        .borrow()
+        .get(&trap_addr)
+        .copied();
+
+    if let Some(trunk_addr) = trunk_addr_option {
+        // This is a trap from one of our hooked functions.
+        if is_current_thread_mocked(trap_addr) {
+            let new_func_addr = get_new_func_addr(trap_addr);
+            println!(
+                "[mockrs] handle_trap_signal: address is mocked, redirecting to 0x{:x}",
+                new_func_addr
+            );
+            unsafe {
+                (*ctx).uc_mcontext.pc = new_func_addr as u64;
+            }
+        } else {
+            // Not mocked for this thread, so execute original instruction from trunk.
+            println!("[mockrs] handle_trap_signal: address is not mocked for this thread, executing original code from trunk at 0x{:x}", trunk_addr);
+            unsafe {
+                (*ctx).uc_mcontext.pc = trunk_addr as u64;
+            }
         }
     } else {
-        println!("[mockrs] handle_trap_signal: address is not mocked, advancing PC");
-        // Not a trap we set, advance PC past the trapping instruction to avoid an infinite loop.
+        // This is not a trap from one of our hooks.
+        // To avoid an infinite loop, we advance PC past the trapping instruction.
         // This assumes the unknown trap instruction is 4 bytes long.
+        println!("[mockrs] handle_trap_signal: address is not hooked, advancing PC");
         unsafe {
             (*ctx).uc_mcontext.pc += 4;
         }
@@ -127,10 +147,8 @@ impl Mocker {
                         let ins = &insns.as_ref()[0];
                         println!("[mockrs] Mocker::mock: first instruction to save: {}", ins);
                         let current_position = G_CURRENT_POSITION.lock().unwrap();
-                        addr_table
-                            .get_mut()
-                            .insert(old_func, current_position.get());
-                        save_old_instruction(&cs, ins, current_position);
+                        let trunk_addr = save_old_instruction(&cs, ins, current_position);
+                        addr_table.get_mut().insert(old_func, trunk_addr);
                         set_mem_writable(old_func, 4);
                         println!("[mockrs] Mocker::mock: writing brk #0 to 0x{:x}", old_func);
                         // brk #0
@@ -157,7 +175,11 @@ impl Mocker {
     }
 }
 
-fn save_old_instruction(cs: &Capstone, ins: &Insn, current_position: MutexGuard<Cell<usize>>) {
+fn save_old_instruction(
+    cs: &Capstone,
+    ins: &Insn,
+    current_position: MutexGuard<Cell<usize>>,
+) -> usize {
     println!("[mockrs] save_old_instruction: saving instruction {}", ins);
     let detail = cs.insn_detail(ins).unwrap();
     let is_branch = detail.groups().iter().any(|&group| {
@@ -173,30 +195,104 @@ fn save_old_instruction(cs: &Capstone, ins: &Insn, current_position: MutexGuard<
 
     let old_len = ins.bytes().len();
     let new_len = old_len;
+    let jump_back_len = 16; // 4 (ldr) + 4 (br) + 8 (addr)
 
-    let current_pos_val = current_position.get();
-    println!("[mockrs] save_old_instruction: current_pos_val=0x{:x}", current_pos_val);
-    if current_pos_val + 3 + new_len - *G_CODE_AREA.lock().unwrap().get_mut()
+    let mut pos = current_position.get();
+    println!("[mockrs] save_old_instruction: current_pos_val=0x{:x}", pos);
+    if pos + 3 + new_len + jump_back_len - *G_CODE_AREA.lock().unwrap().get_mut()
         >= get_code_area_size()
     {
         panic!("Code area overflow");
     }
 
-    write_memory(current_pos_val, &[old_len as u8]);
-    current_position.set(current_pos_val + 1);
+    // Metadata is not executable, so we write it first.
+    write_memory(pos, &[old_len as u8]);
+    pos += 1;
+    write_memory(pos, &[new_len as u8]);
+    pos += 1;
+    write_memory(pos, &[0]);
+    pos += 1;
 
-    let current_pos_val = current_position.get();
-    write_memory(current_pos_val, &[new_len as u8]);
-    current_position.set(current_pos_val + 1);
+    // The executable part of the trunk starts here.
+    let trunk_addr = pos;
 
-    let current_pos_val = current_position.get();
-    write_memory(current_pos_val, &[0]);
-    current_position.set(current_pos_val + 1);
+    // Write original instruction bytes.
+    let mut ins_bytes = ins.bytes().to_vec();
 
-    let current_pos_val = current_position.get();
-    write_memory(current_pos_val, ins.bytes());
-    current_position.set(current_pos_val + new_len);
+    if ins.id() == InsnId(arm64::Arm64Insn::ARM64_INS_ADRP as u32) {
+        println!("[mockrs] save_old_instruction: relocating ADRP instruction");
+        let detail = cs.insn_detail(ins).unwrap();
+        let arch_detail = detail.arch_detail();
+        let ops = arch_detail.operands();
+
+        let target_page_addr = if let capstone::arch::ArchOperand::Arm64Operand(op) = &ops[1] {
+            if let capstone::arch::arm64::Arm64OperandType::Imm(imm) = op.op_type {
+                imm as usize
+            } else {
+                panic!("ADRP's second operand is not an immediate value");
+            }
+        } else {
+            panic!("Unexpected operand type for ADRP");
+        };
+
+        let new_pc_page = trunk_addr & !0xFFF;
+        let offset = target_page_addr.wrapping_sub(new_pc_page);
+
+        if offset % 4096 != 0 {
+            panic!("ADRP relocation failed: offset is not a multiple of 4096. This should not happen if capstone provides a page-aligned address.");
+        }
+        let imm21 = (offset >> 12) as i64;
+
+        if imm21 >= -(1 << 20) && imm21 < (1 << 20) {
+            // Offset is in range, re-encode the instruction
+            println!("[mockrs] save_old_instruction: ADRP offset 0x{:x} is in range", offset);
+            let immlo = (imm21 & 0x3) as u32;
+            let immhi = ((imm21 >> 2) & 0x7FFFF) as u32;
+
+            let mut ins_word = u32::from_le_bytes(ins_bytes.as_slice().try_into().unwrap());
+            ins_word &= !((0x3 << 29) | (0x7FFFF << 5)); // Clear immlo and immhi
+            ins_word |= immlo << 29;
+            ins_word |= immhi << 5;
+
+            ins_bytes = ins_word.to_le_bytes().to_vec();
+        } else {
+            // Offset is out of range, generate a new instruction sequence
+            println!("[mockrs] save_old_instruction: ADRP offset 0x{:x} out of range, generating LDR literal sequence", offset);
+            let ins_word = u32::from_le_bytes(ins_bytes.as_slice().try_into().unwrap());
+            let rd_idx = ins_word & 0x1F;
+            // LDR Xd, #8
+            let ldr_instr = 0x58000040 | rd_idx;
+            // B #12
+            let b_instr: u32 = 0x14000003;
+            let mut new_bytes = Vec::new();
+            new_bytes.extend_from_slice(&ldr_instr.to_le_bytes());
+            new_bytes.extend_from_slice(&b_instr.to_le_bytes());
+            new_bytes.extend_from_slice(&target_page_addr.to_le_bytes());
+            ins_bytes = new_bytes;
+        }
+    }
+    write_memory(pos, &ins_bytes);
+    pos += ins_bytes.len();
+
+    // Write jump-back sequence.
+    let jump_back_addr = ins.address() as usize + ins.len();
+    // ldr x16, #8  ; load from 8 bytes ahead (address literal)
+    // br x16
+    let jump_instrs = [
+        0x50, 0x00, 0x00, 0x58, // ldr x16, #8
+        0x00, 0x02, 0x1f, 0xd6, // br x16
+    ];
+    write_memory(pos, &jump_instrs);
+    pos += jump_instrs.len();
+
+    // Write the address literal for the jump.
+    write_memory(pos, &jump_back_addr.to_le_bytes());
+    pos += 8;
+
+    current_position.set(pos);
     println!("[mockrs] save_old_instruction: new_pos=0x{:x}", current_position.get());
+
+    trunk_addr
 }
 
 fn read_memory(addr: usize, len: usize) -> Vec<u8> {
