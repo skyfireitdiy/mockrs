@@ -8,7 +8,7 @@ path = "src/lib.rs"
 
 [package]
 name = "mockrs"
-version = "1.1.2"
+version = "1.2.0"
 edition = "2021"
 authors = ["skyfire <skyfireitdiy@hotmail.com>"]
 description = "A crate that provides a X8664Mocker to mock function calls and intercept on x86_64 architecture."

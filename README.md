@@ -5,7 +5,7 @@
 
 ## Overview
 
-The `mockrs` crate provides a powerful tool for function mocking and interception in Rust, specifically designed for the x86_64 architecture. This utility is particularly useful for testing and debugging purposes, where you need to replace the behavior of a function temporarily.
+The `mockrs` crate provides a powerful tool for function mocking and interception in Rust, supporting both x86_64 and aarch64 architectures. This utility is particularly useful for testing and debugging purposes, where you need to replace the behavior of a function temporarily.
 
 ## Key Features
 
@@ -48,22 +48,22 @@ fn main() {
 
 ### API Reference
 
-#### `X8664Mocker`
+#### `Mocker`
 
-The `X8664Mocker` struct is the core of the crate, providing the functionality to mock functions.
+The `Mocker` struct is the core of the crate, providing the functionality to mock functions. It is an alias for the architecture-specific mocker (`X8664Mocker` or `Aarch64Mocker`).
 
-- `pub fn mock(old_func: usize, new_func: usize) -> X8664Mocker`: Creates a new instance of `X8664Mocker` to mock the specified function.
+- `pub fn new(old_func: usize, new_func: usize) -> Mocker`: Creates a new instance of `Mocker` to mock the specified function.
 
 #### `mock!` Macro
 
 A convenient macro to create a new `X8664Mocker` instance.
 
-- `mock!($old_func:expr, $new_func:expr)`: Replaces the original function `$old_func` with the new function `$new_func`.
+- `mock!($old_func:expr, $new_func:expr)`: A convenient macro that creates a `Mocker` instance, replacing the original function `$old_func` with `$new_func`.
 
 ### Safety and Considerations
 
 - The `mockrs` operates at a low level, manipulating memory and handling signals. Use it with caution and ensure that the original and new functions have compatible signatures.
-- This crate is designed for use on the x86_64 architecture only.
+- This crate currently supports the x86_64 and aarch64 architectures.
 
 
 ## Contribution
