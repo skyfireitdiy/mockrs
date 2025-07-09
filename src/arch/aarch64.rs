@@ -200,7 +200,9 @@ fn save_old_instruction(cs: &Capstone, ins: &Insn, current_position: MutexGuard<
 }
 
 fn read_memory(addr: usize, len: usize) -> Vec<u8> {
-    let mut buf = vec, len);
+    let mut buf = vec![0u8; len];
+    unsafe {
+        std::ptr::copy_nonoverlapping(addr as *const u8, buf.as_mut_ptr(), len);
     }
     buf
 }
