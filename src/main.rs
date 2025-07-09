@@ -12,7 +12,7 @@ fn main() {
     }
 
     fn original_function2() -> f64 {
-        3.14
+        std::f64::consts::PI
     }
 
     fn mock_function2() -> f64 {
@@ -31,7 +31,7 @@ fn main() {
     println!("Mocked functions return the correct values.");
 
     assert_eq!(thread::spawn(original_function1).join().unwrap(), 42);
-    assert_eq!(thread::spawn(original_function2).join().unwrap(), 3.14);
+    assert_eq!(thread::spawn(original_function2).join().unwrap(), std::f64::consts::PI);
     println!("Functions in new threads return original values.");
 
     // Drop the mockers to restore the original functions
@@ -40,6 +40,6 @@ fn main() {
 
     // Assert that the original functions return the expected values after dropping the mockers
     assert_eq!(original_function1(), 42);
-    assert_eq!(original_function2(), 3.14);
+    assert_eq!(original_function2(), std::f64::consts::PI);
     println!("Restored functions return the original values.");
 }

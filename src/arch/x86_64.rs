@@ -38,6 +38,7 @@ const DEFAULT_CODE_AREA_SIZE: usize = 8 * PAGE_SIZE;
 
 /// `InstrPosition`结构体，用于存储指令位置
 #[derive(Clone, Copy)]
+#[derive(Default)]
 struct InstrPosition {
     orig_addr: usize,
     trunk_addr: usize,
@@ -47,18 +48,6 @@ struct InstrPosition {
     replace_data: i64,
 }
 
-impl Default for InstrPosition {
-    fn default() -> Self {
-        Self {
-            orig_addr: 0,
-            trunk_addr: 0,
-            old_len: 0,
-            new_len: 0,
-            replace_reg: 0,
-            replace_data: 0,
-        }
-    }
-}
 
 /// `Droper`结构体，用于释放资源
 struct Droper {}
@@ -131,7 +120,7 @@ fn get_context_reg_index(reg: u8) -> i32 {
     } else if reg == Register::RSI as u8 {
         return REG_RSI;
     }
-    return -1;
+    -1
 }
 
 /// 处理陷阱信号
@@ -148,9 +137,11 @@ extern "C" fn handle_trap_signal(_: i32, _: *mut siginfo_t, ucontext: *mut c_voi
         } else {
             enter_step_mode(ctx);
             let trunk_addr = get_bak_instruction_addr(orig_addr);
-            let mut patch = InstrPosition::default();
-            patch.orig_addr = orig_addr;
-            patch.trunk_addr = trunk_addr;
+            let mut patch = InstrPosition {
+                orig_addr,
+                trunk_addr,
+                ..Default::default()
+            };
             let buf = read_memory(trunk_addr, 3);
             patch.old_len = buf[0];
             patch.new_len = buf[1];
@@ -207,7 +198,7 @@ fn set_ip_register(ctx: *mut ucontext_t, new_func_addr: usize) {
 
 /// 获取新函数地址
 fn get_new_func_addr(old_func: usize) -> usize {
-    G_THREAD_REPLACE_TABLE.with(|x| x.borrow().get(&old_func).unwrap().last().unwrap().clone())
+    G_THREAD_REPLACE_TABLE.with(|x| *x.borrow().get(&old_func).unwrap().last().unwrap())
 }
 
 /// 判断当前线程是否被模拟
@@ -293,13 +284,13 @@ fn get_replace_register(ins: &Instruction) -> Register {
         Register::RSI,
     ]
     .iter()
-    .find(|r| regs.iter().find(|t| t == r).is_none())
+    .find(|r| !regs.iter().any(|t| &t == r))
     .unwrap()
 }
 
 /// 生成新指令
 fn make_new_instruction(ins: Instruction, reg: Register) -> Instruction {
-    let mut bak_ins = ins.clone();
+    let mut bak_ins = ins;
     if bak_ins.memory_base().is_ip() {
         bak_ins.set_memory_base(reg);
         bak_ins.set_memory_displacement64(
@@ -313,11 +304,11 @@ fn make_new_instruction(ins: Instruction, reg: Register) -> Instruction {
 fn save_old_instruction(ins: &Instruction, current_position: MutexGuard<Cell<usize>>) {
     let old_len = ins.len();
     let mut replace_reg = Register::None;
-    let mut new_instruction = ins.clone();
+    let mut new_instruction = *ins;
 
     if ins.is_ip_rel_memory_operand() {
         replace_reg = get_replace_register(ins);
-        new_instruction = make_new_instruction(ins.clone(), replace_reg);
+        new_instruction = make_new_instruction(*ins, replace_reg);
     }
 
     let mut encoder = Encoder::new(64);
@@ -342,7 +333,7 @@ fn save_old_instruction(ins: &Instruction, current_position: MutexGuard<Cell<usi
             current_position.set(current_position.get() + new_len);
         }
         Err(e) => {
-            println!("{}", e.to_string());
+            println!("{}", e);
             panic!("Failed to encode instruction block");
         }
     }

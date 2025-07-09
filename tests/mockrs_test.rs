@@ -46,7 +46,7 @@ mod mockrs_tests {
 
         fn original_function2() -> f64 {
             // println!("this is print");
-            3.14
+            std::f64::consts::PI
         }
 
         fn mock_function2() -> f64 {
@@ -64,7 +64,7 @@ mod mockrs_tests {
         assert_eq!(original_function2(), 2.71);
 
         assert_eq!(thread::spawn(original_function1).join().unwrap(), 42);
-        assert_eq!(thread::spawn(original_function2).join().unwrap(), 3.14);
+        assert_eq!(thread::spawn(original_function2).join().unwrap(), std::f64::consts::PI);
 
         // Drop the mockers to restore the original functions
         drop(mocker1);
@@ -72,7 +72,7 @@ mod mockrs_tests {
 
         // Assert that the original functions return the expected values after dropping the mockers
         assert_eq!(original_function1(), 42);
-        assert_eq!(original_function2(), 3.14);
+        assert_eq!(original_function2(), std::f64::consts::PI);
     }
 
     #[test]
