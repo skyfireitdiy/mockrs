@@ -1,62 +1,15 @@
+use super::common::*;
 use capstone::arch::{arm64, BuildsCapstone, BuildsCapstoneEndian};
 use capstone::{Capstone, Endian, Insn, InsnId};
-use lazy_static::lazy_static;
 use nix::{
     libc::*,
-    sys::{
-        mman::{mmap_anonymous, mprotect, MapFlags, ProtFlags},
-        signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal},
-    },
+    sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal},
 };
 use std::{
-    cell::{Cell, OnceCell, RefCell},
+    cell::{Cell, RefCell},
     collections::HashMap,
-    ffi::c_void,
-    num::NonZeroUsize,
-    ptr::NonNull,
     sync::{Mutex, MutexGuard},
 };
-
-/// `Mocker`结构体，用于模拟函数
-pub struct Mocker {
-    old_func: usize,
-    new_func: usize,
-}
-
-lazy_static! {
-    static ref G_TRUNK_ADDR_TABLE: Mutex<RefCell<HashMap<usize, usize>>> =
-        Mutex::new(RefCell::new(HashMap::new()));
-}
-static G_REPLACE_LEN: usize = 16;
-static G_INIT_FLAG: Mutex<OnceCell<()>> = Mutex::new(OnceCell::new());
-
-static G_CODE_AREA: Mutex<RefCell<usize>> = Mutex::new(RefCell::new(0));
-
-const PAGE_SIZE: usize = 4096;
-const DEFAULT_CODE_AREA_SIZE: usize = 8 * PAGE_SIZE;
-
-/// `Droper`结构体，用于释放资源
-struct Droper {}
-
-#[allow(dead_code)]
-static G_DROPER: Droper = Droper {};
-
-impl Drop for Droper {
-    fn drop(&mut self) {
-        let code_area: usize = *G_CODE_AREA.lock().unwrap().get_mut();
-        if code_area != 0 {
-            unsafe {
-                munmap(code_area as *mut c_void, get_code_area_size());
-            }
-        }
-    }
-}
-
-static G_CURRENT_POSITION: Mutex<Cell<usize>> = Mutex::new(Cell::new(0));
-
-thread_local! {
-    static G_THREAD_REPLACE_TABLE: RefCell<HashMap<usize, Vec<usize>>> = RefCell::new(HashMap::new());
-}
 
 extern "C" fn handle_trap_signal(_: i32, _info: *mut siginfo_t, ucontext: *mut c_void) {
     let ctx = ucontext as *mut ucontext_t;
@@ -70,47 +23,21 @@ extern "C" fn handle_trap_signal(_: i32, _info: *mut siginfo_t, ucontext: *mut c
         .copied();
 
     if let Some(trunk_addr) = trunk_addr_option {
-        // This is a trap from one of our hooked functions.
         if is_current_thread_mocked(trap_addr) {
             let new_func_addr = get_new_func_addr(trap_addr);
             unsafe {
                 (*ctx).uc_mcontext.pc = new_func_addr as u64;
             }
         } else {
-            // Not mocked for this thread, so execute original instruction from trunk.
             unsafe {
                 (*ctx).uc_mcontext.pc = trunk_addr as u64;
             }
         }
     } else {
-        // This is not a trap from one of our hooks.
-        // To avoid an infinite loop, we advance PC past the trapping instruction.
-        // This assumes the unknown trap instruction is 4 bytes long.
         unsafe {
             (*ctx).uc_mcontext.pc += 4;
         }
     }
-}
-
-#[allow(dead_code)]
-fn get_bak_instruction_addr(old_func: usize) -> usize {
-    let addr = *G_TRUNK_ADDR_TABLE
-        .lock()
-        .unwrap()
-        .borrow()
-        .get(&old_func)
-        .unwrap();
-    addr
-}
-
-fn get_new_func_addr(old_func: usize) -> usize {
-    let addr = G_THREAD_REPLACE_TABLE.with(|x| *x.borrow().get(&old_func).unwrap().last().unwrap());
-    addr
-}
-
-fn is_current_thread_mocked(old_func: usize) -> bool {
-    let result = G_THREAD_REPLACE_TABLE.with(|x| x.borrow().get(&old_func).is_some());
-    result
 }
 
 impl Mocker {
@@ -137,7 +64,6 @@ impl Mocker {
                         let trunk_addr = save_old_instruction(&cs, ins, current_position);
                         addr_table.get_mut().insert(old_func, trunk_addr);
                         set_mem_writable(old_func, 4);
-                        // brk #0
                         write_memory(old_func, &[0x00, 0x00, 0x20, 0xd4]);
                     } else {
                         panic!("Failed to disassemble instruction at 0x{old_func:x}");
@@ -180,7 +106,7 @@ fn save_old_instruction(
 
     let old_len = ins.bytes().len();
     let new_len = old_len;
-    let jump_back_len = 16; // 4 (ldr) + 4 (br) + 8 (addr)
+    let jump_back_len = 16;
 
     let mut pos = current_position.get();
     if pos + 3 + new_len + jump_back_len - *G_CODE_AREA.lock().unwrap().get_mut()
@@ -189,7 +115,6 @@ fn save_old_instruction(
         panic!("Code area overflow");
     }
 
-    // Metadata is not executable, so we write it first.
     write_memory(pos, &[old_len as u8]);
     pos += 1;
     write_memory(pos, &[new_len as u8]);
@@ -197,10 +122,8 @@ fn save_old_instruction(
     write_memory(pos, &[0]);
     pos += 1;
 
-    // The executable part of the trunk starts here.
     let trunk_addr = pos;
 
-    // Write original instruction bytes.
     let mut ins_bytes = ins.bytes().to_vec();
 
     if ins.id() == InsnId(arm64::Arm64Insn::ARM64_INS_ADRP as u32) {
@@ -227,23 +150,19 @@ fn save_old_instruction(
         let imm21 = (offset >> 12) as i64;
 
         if (-(1 << 20)..(1 << 20)).contains(&imm21) {
-            // Offset is in range, re-encode the instruction
             let immlo = (imm21 & 0x3) as u32;
             let immhi = ((imm21 >> 2) & 0x7FFFF) as u32;
 
             let mut ins_word = u32::from_le_bytes(ins_bytes.as_slice().try_into().unwrap());
-            ins_word &= !((0x3 << 29) | (0x7FFFF << 5)); // Clear immlo and immhi
+            ins_word &= !((0x3 << 29) | (0x7FFFF << 5));
             ins_word |= immlo << 29;
             ins_word |= immhi << 5;
 
             ins_bytes = ins_word.to_le_bytes().to_vec();
         } else {
-            // Offset is out of range, generate a new instruction sequence
             let ins_word = u32::from_le_bytes(ins_bytes.as_slice().try_into().unwrap());
             let rd_idx = ins_word & 0x1F;
-            // LDR Xd, #8
             let ldr_instr = 0x58000040 | rd_idx;
-            // B #12
             let b_instr: u32 = 0x14000003;
             let mut new_bytes = Vec::new();
             new_bytes.extend_from_slice(&ldr_instr.to_le_bytes());
@@ -255,32 +174,19 @@ fn save_old_instruction(
     write_memory(pos, &ins_bytes);
     pos += ins_bytes.len();
 
-    // Write jump-back sequence.
     let jump_back_addr = ins.address() as usize + ins.len();
-    // ldr x16, #8  ; load from 8 bytes ahead (address literal)
-    // br x16
     let jump_instrs = [
-        0x50, 0x00, 0x00, 0x58, // ldr x16, #8
-        0x00, 0x02, 0x1f, 0xd6, // br x16
+        0x50, 0x00, 0x00, 0x58, 0x00, 0x02, 0x1f, 0xd6,
     ];
     write_memory(pos, &jump_instrs);
     pos += jump_instrs.len();
 
-    // Write the address literal for the jump.
     write_memory(pos, &jump_back_addr.to_le_bytes());
     pos += 8;
 
     current_position.set(pos);
 
     trunk_addr
-}
-
-fn read_memory(addr: usize, len: usize) -> Vec<u8> {
-    let mut buf = vec![0u8; len];
-    unsafe {
-        std::ptr::copy_nonoverlapping(addr as *const u8, buf.as_mut_ptr(), len);
-    }
-    buf
 }
 
 fn write_memory(addr: usize, data: &[u8]) {
@@ -290,12 +196,10 @@ fn write_memory(addr: usize, data: &[u8]) {
     flush_instruction_cache(addr, data.len());
 }
 
-/// Flush the instruction cache for the given memory range.
-/// This is necessary to ensure that the CPU executes the newly written instructions.
 fn flush_instruction_cache(addr: usize, len: usize) {
     let end = addr + len;
     let mut current = addr;
-    let icache_line_size = 64; // A common cache line size for aarch64
+    let icache_line_size = 64;
 
     unsafe {
         core::arch::asm!("dsb sy", options(nostack, preserves_flags));
@@ -323,30 +227,6 @@ fn init_mock() {
     });
 }
 
-fn get_code_area_size() -> usize {
-    std::env::var("MOCKRS_CODE_AREA_SIZE_IN_PAGE")
-        .map(|x| x.parse::<usize>().unwrap() * PAGE_SIZE)
-        .unwrap_or(DEFAULT_CODE_AREA_SIZE)
-}
-
-fn alloc_code_area() {
-    unsafe {
-        let code_area = mmap_anonymous(
-            None,
-            NonZeroUsize::new(get_code_area_size()).unwrap(),
-            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC,
-            MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
-        )
-        .unwrap()
-        .as_ptr();
-        *G_CODE_AREA.lock().unwrap().get_mut() = code_area as usize;
-        G_CURRENT_POSITION
-            .lock()
-            .unwrap()
-            .replace(code_area as usize);
-    }
-}
-
 fn setup_trap_handler() {
     if let Err(err) = unsafe {
         sigaction(
@@ -359,42 +239,5 @@ fn setup_trap_handler() {
         )
     } {
         panic!("Failed to set signal handler: {err:?}");
-    }
-}
-
-fn get_page_bound(addr: usize, len: usize) -> (usize, usize) {
-    (
-        addr & !(PAGE_SIZE - 1),
-        (addr + len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1),
-    )
-}
-
-fn set_mem_writable(old_func: usize, len: usize) {
-    let (low, high) = get_page_bound(old_func, len);
-    unsafe {
-        mprotect(
-            NonNull::new(low as *mut c_void).unwrap(),
-            high - low,
-            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE | ProtFlags::PROT_EXEC,
-        )
-        .unwrap()
-    };
-}
-
-impl Drop for Mocker {
-    fn drop(&mut self) {
-        G_THREAD_REPLACE_TABLE.with(|x| {
-            let mut x = x.borrow_mut();
-            let mut should_remove = false;
-            if let Some(v) = x.get_mut(&self.old_func) {
-                v.retain(|&new_func| new_func != self.new_func);
-                if v.is_empty() {
-                    should_remove = true;
-                }
-            }
-            if should_remove {
-                x.remove(&self.old_func);
-            }
-        });
     }
 }

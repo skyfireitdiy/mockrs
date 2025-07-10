@@ -16,10 +16,8 @@
 //! }
 //! ```
 
-mod arch;
-
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-pub use arch::*;
+pub mod arch;
 
 /// 用于创建`Mocker`实例的宏
 ///
@@ -53,6 +51,6 @@ pub use arch::*;
 #[macro_export]
 macro_rules! mock {
     ($old_func:expr, $new_func:expr) => {{
-        $crate::Mocker::mock($old_func as usize, $new_func as usize)
+        $crate::arch::Mocker::mock($old_func as usize, $new_func as usize)
     }};
 }
