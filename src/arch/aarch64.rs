@@ -398,10 +398,3 @@ impl Drop for Mocker {
         });
     }
 }
-
-#[macro_export]
-macro_rules! mock {
-    ($old_func:expr, $new_func:expr) => {{
-        $crate::Mocker::mock($old_func as usize, $new_func as usize)
-    }};
-}
