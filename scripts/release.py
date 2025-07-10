@@ -5,6 +5,7 @@ A script to handle version bumping, committing, and tagging.
 import re
 import sys
 import subprocess
+import os
 
 
 def get_current_version():
@@ -73,7 +74,10 @@ def main():
     tag_name = f"v{new_version_str}"
 
     subprocess.run(["git", "add", "Cargo.toml", "Cargo.lock"], check=True)
-    subprocess.run(["git", "commit", "-m", commit_message], check=True)
+    commit_env = os.environ.copy()
+    commit_env["GIT_AUTHOR_NAME"] = "skyfire"
+    commit_env["GIT_AUTHOR_EMAIL"] = "skyfireitdiy@hotmail.com"
+    subprocess.run(["git", "commit", "-m", commit_message], check=True, env=commit_env)
     print(f"Committed with message: '{commit_message}'")
 
     subprocess.run(["git", "tag", tag_name], check=True)
