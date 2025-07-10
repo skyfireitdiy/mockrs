@@ -5,11 +5,7 @@ use nix::{
     libc::*,
     sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal},
 };
-use std::{
-    cell::{Cell, RefCell},
-    collections::HashMap,
-    sync::{Mutex, MutexGuard},
-};
+use std::{cell::Cell, sync::MutexGuard};
 
 extern "C" fn handle_trap_signal(_: i32, _info: *mut siginfo_t, ucontext: *mut c_void) {
     let ctx = ucontext as *mut ucontext_t;
@@ -98,10 +94,53 @@ fn save_old_instruction(
     });
 
     if is_branch {
-        unimplemented!(
-            "PC-relative instruction relocation is not yet implemented for aarch64. Mnemonic: {}",
-            ins.mnemonic().unwrap_or("?")
-        );
+        let arch_detail = detail.arch_detail();
+        let ops = arch_detail.operands();
+
+        let target_addr = if let capstone::arch::ArchOperand::Arm64Operand(op) = &ops[0] {
+            if let capstone::arch::arm64::Arm64OperandType::Imm(imm) = op.op_type {
+                imm as usize
+            } else {
+                panic!("Branch target is not an immediate value");
+            }
+        } else {
+            panic!("Unexpected operand type for branch instruction");
+        };
+
+        let mut new_bytes = Vec::new();
+        // LDR X17, #8
+        new_bytes.extend_from_slice(&0x58000051_u32.to_le_bytes());
+
+        if ins.id() == InsnId(arm64::Arm64Insn::ARM64_INS_BL as u32) {
+            // BLR X17
+            new_bytes.extend_from_slice(&0xd63f0220_u32.to_le_bytes());
+        } else {
+            // BR X17, for B, B.cond etc.
+            new_bytes.extend_from_slice(&0xd61f0220_u32.to_le_bytes());
+        }
+        new_bytes.extend_from_slice(&target_addr.to_le_bytes());
+
+        let old_len = ins.bytes().len();
+        let new_len = new_bytes.len();
+
+        let mut pos = current_position.get();
+        if pos + 3 + new_len - *G_CODE_AREA.lock().unwrap().get_mut() >= get_code_area_size() {
+            panic!("Code area overflow");
+        }
+
+        write_memory(pos, &[old_len as u8]);
+        pos += 1;
+        write_memory(pos, &[new_len as u8]);
+        pos += 1;
+        write_memory(pos, &[0]); // No register replacement
+        pos += 1;
+
+        let trunk_addr = pos;
+        write_memory(pos, &new_bytes);
+        pos += new_len;
+
+        current_position.set(pos);
+        return trunk_addr;
     }
 
     let old_len = ins.bytes().len();
@@ -175,9 +214,7 @@ fn save_old_instruction(
     pos += ins_bytes.len();
 
     let jump_back_addr = ins.address() as usize + ins.len();
-    let jump_instrs = [
-        0x50, 0x00, 0x00, 0x58, 0x00, 0x02, 0x1f, 0xd6,
-    ];
+    let jump_instrs = [0x50, 0x00, 0x00, 0x58, 0x00, 0x02, 0x1f, 0xd6];
     write_memory(pos, &jump_instrs);
     pos += jump_instrs.len();
 

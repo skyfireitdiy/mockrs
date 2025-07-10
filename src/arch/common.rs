@@ -54,16 +54,6 @@ thread_local! {
     pub static G_THREAD_REPLACE_TABLE: RefCell<HashMap<usize, Vec<usize>>> = RefCell::new(HashMap::new());
 }
 
-/// 获取备份指令地址
-pub fn get_bak_instruction_addr(old_func: usize) -> usize {
-    *G_TRUNK_ADDR_TABLE
-        .lock()
-        .unwrap()
-        .borrow()
-        .get(&old_func)
-        .unwrap()
-}
-
 /// 获取新函数地址
 pub fn get_new_func_addr(old_func: usize) -> usize {
     G_THREAD_REPLACE_TABLE.with(|x| *x.borrow().get(&old_func).unwrap().last().unwrap())

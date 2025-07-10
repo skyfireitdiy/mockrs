@@ -4,11 +4,7 @@ use nix::{
     libc::*,
     sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal},
 };
-use std::{
-    cell::Cell,
-    ffi::c_void,
-    sync::MutexGuard,
-};
+use std::{cell::Cell, ffi::c_void, sync::MutexGuard};
 
 #[derive(Clone, Copy, Default)]
 struct InstrPosition {
@@ -73,6 +69,15 @@ extern "C" fn handle_trap_signal(_: i32, _: *mut siginfo_t, ucontext: *mut c_voi
         unsafe { (*ctx).uc_mcontext.gregs[REG_RIP as usize] = new_func_addr as i64 };
     }
 
+    fn get_bak_instruction_addr(old_func: usize) -> usize {
+        *G_TRUNK_ADDR_TABLE
+            .lock()
+            .unwrap()
+            .borrow()
+            .get(&old_func)
+            .unwrap()
+    }
+
     if !is_step_mode(eflags) {
         let orig_addr = rip - 1;
 
@@ -95,8 +100,7 @@ extern "C" fn handle_trap_signal(_: i32, _: *mut siginfo_t, ucontext: *mut c_voi
             if r != -1 {
                 unsafe {
                     patch.replace_data = (*ctx).uc_mcontext.gregs[r as usize];
-                    (*ctx).uc_mcontext.gregs[r as usize] =
-                        orig_addr as i64 + patch.old_len as i64;
+                    (*ctx).uc_mcontext.gregs[r as usize] = orig_addr as i64 + patch.old_len as i64;
                 };
             }
             G_CURRENT_REPLACE.with(|x| x.set(patch));
@@ -141,8 +145,7 @@ impl Mocker {
             let mut encoder = Encoder::new(64);
             match encoder.encode(&new_instruction, ins.ip()) {
                 Ok(new_len) => {
-                    if current_position.get() + 3 + new_len
-                        - *G_CODE_AREA.lock().unwrap().get_mut()
+                    if current_position.get() + 3 + new_len - *G_CODE_AREA.lock().unwrap().get_mut()
                         >= get_code_area_size()
                     {
                         panic!("Code area overflow");

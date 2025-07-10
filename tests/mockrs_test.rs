@@ -64,7 +64,10 @@ mod mockrs_tests {
         assert_eq!(original_function2(), 2.71);
 
         assert_eq!(thread::spawn(original_function1).join().unwrap(), 42);
-        assert_eq!(thread::spawn(original_function2).join().unwrap(), std::f64::consts::PI);
+        assert_eq!(
+            thread::spawn(original_function2).join().unwrap(),
+            std::f64::consts::PI
+        );
 
         // Drop the mockers to restore the original functions
         drop(mocker1);
@@ -213,6 +216,45 @@ mod mockrs_tests {
         drop(mocker2);
 
         // Assert that the original function returns the expected value after dropping the mockers
+        assert_eq!(original_function(), 42);
+    }
+
+    #[test]
+    #[cfg(target_arch = "aarch64")]
+    fn test_mock_function_with_relative_jump() {
+        use std::arch::asm;
+
+        #[inline(never)]
+        fn original_function() -> i32 {
+            unsafe {
+                asm!(
+                    "b 1f",        // Branch to label 1
+                    "nop",         // This part will be skipped
+                    "1:",          // Label 1
+                    "mov x0, #42", // Return 42
+                );
+            }
+            // The return value is in x0, which is the standard return register
+            // Rust will handle the rest of the function epilogue
+            // We need a return statement to satisfy the type checker
+            42
+        }
+
+        fn mock_function() -> i32 {
+            100
+        }
+
+        // The assembly function always returns 42
+        assert_eq!(original_function(), 42);
+
+        let mocker = mock!(original_function, mock_function);
+
+        // After mocking, it should return 100
+        assert_eq!(original_function(), 100);
+
+        drop(mocker);
+
+        // After dropping the mocker, it should return 42 again
         assert_eq!(original_function(), 42);
     }
 }
