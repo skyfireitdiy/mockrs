@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  aarch64-dev:
+    image: aarch64-rust-dev:latest
+    container_name: aarch64-rust-dev-container
+    platform: linux/arm64
+    tty: true
+    stdin_open: true
+    restart: unless-stopped
+    volumes:
+      - ./workspace:/app
+    working_dir: /app
