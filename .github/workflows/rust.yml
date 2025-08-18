@@ -1,10 +1,11 @@
+---
 name: Rust
 
-on:
+"on":
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,8 +16,46 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      - uses: actions/checkout@v4
+      - name: Build
+        run: cargo build --verbose
+      - name: Run tests
+        run: cargo test --verbose
+
+  test-aarch64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Enable ARM64 cross toolchain and QEMU user emulation
+        run: |
+          sudo dpkg --add-architecture arm64
+          sudo apt-get update
+          # qemu + binfmt for transparent execution and cross toolchain
+          # includes aarch64 sysroot and build tools
+          sudo apt-get install -y \
+            qemu-user-static binfmt-support \
+            gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
+            libc6:arm64 libgcc-s1:arm64 libstdc++6:arm64 \
+            pkg-config make cmake
+          sudo update-binfmts --enable qemu-aarch64
+
+      - name: Install Rust toolchain and aarch64 target
+        run: |
+          rustup toolchain install stable
+          rustup target add aarch64-unknown-linux-gnu
+
+      - name: Build (aarch64)
+        run: |
+          export AARCH64_LD=aarch64-linux-gnu-gcc
+          export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="$AARCH64_LD"
+          export QEMU_LD_PREFIX=/usr/aarch64-linux-gnu
+          cargo build --target aarch64-unknown-linux-gnu --verbose
+
+      - name: Run tests (aarch64 via qemu-user-static)
+        run: |
+          export AARCH64_LD=aarch64-linux-gnu-gcc
+          export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="$AARCH64_LD"
+          export QEMU_LD_PREFIX=/usr/aarch64-linux-gnu
+          export RUST_BACKTRACE=1
+          cargo test --target aarch64-unknown-linux-gnu --verbose

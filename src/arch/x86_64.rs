@@ -1,5 +1,5 @@
 use super::common::*;
-use iced_x86::{Decoder, DecoderOptions, Encoder, Instruction, Register};
+use iced_x86::{Decoder, DecoderOptions, Encoder, Instruction, InstructionInfoFactory, Register};
 use nix::{
     libc::*,
     sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal},
@@ -173,6 +173,10 @@ impl Mocker {
         fn make_new_instruction(ins: Instruction, reg: Register) -> Instruction {
             let mut bak_ins = ins;
             if bak_ins.memory_base().is_ip() {
+                // For RIP-relative addressing, iced-x86 encodes the displacement as a 32-bit
+                // value relative to next_ip. After switching the base to a GPR whose value
+                // we set to next_ip in the signal handler, the displacement we must encode
+                // is EA - next_ip.
                 bak_ins.set_memory_base(reg);
                 bak_ins.set_memory_displacement64(
                     ins.memory_displacement64().overflowing_sub(ins.next_ip()).0,
@@ -182,18 +186,27 @@ impl Mocker {
         }
 
         fn get_replace_register(ins: &Instruction) -> Register {
-            let regs: Vec<Register> = (0..=4u32).map(|i| ins.op_register(i)).collect();
-            *[
+            // Prefer caller-saved registers per System V x86_64 ABI.
+            // Exclude any register (explicit or implicit) used by the instruction.
+            let candidates = [
                 Register::RAX,
-                Register::RBX,
                 Register::RCX,
                 Register::RDX,
-                Register::RDI,
                 Register::RSI,
-            ]
-            .iter()
-            .find(|r| !regs.iter().any(|t| &t == r))
-            .unwrap()
+                Register::RDI,
+                Register::R8,
+                Register::R9,
+                Register::R10,
+                Register::R11,
+            ];
+            let mut info_factory = InstructionInfoFactory::new();
+            let info = info_factory.info(ins);
+            let used: Vec<Register> = info.used_registers().iter().map(|u| u.register()).collect();
+
+            *candidates
+                .iter()
+                .find(|&&r| !used.contains(&r))
+                .expect("No available caller-saved register to use for RIP-relative rewrite")
         }
 
         fn write_memory(addr: usize, data: &[u8]) {
