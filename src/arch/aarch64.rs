@@ -16,7 +16,6 @@ extern "C" fn handle_trap_signal(_: i32, _info: *mut siginfo_t, ucontext: *mut c
     let trunk_addr_option = G_TRUNK_ADDR_TABLE
         .lock()
         .unwrap()
-        .borrow()
         .get(&trap_addr)
         .copied();
 
@@ -44,7 +43,7 @@ impl Mocker {
 
         {
             let mut addr_table = G_TRUNK_ADDR_TABLE.lock().unwrap();
-            if addr_table.borrow().get(&old_func).is_none() {
+            if addr_table.get(&old_func).is_none() {
                 let ins_mem = read_memory(old_func, G_REPLACE_LEN).clone();
                 let cs = Capstone::new()
                     .arm64()
@@ -60,7 +59,7 @@ impl Mocker {
                         let ins = &insns.as_ref()[0];
                         let current_position = G_CURRENT_POSITION.lock().unwrap();
                         let trunk_addr = save_old_instruction(&cs, ins, current_position);
-                        addr_table.get_mut().insert(old_func, trunk_addr);
+                        addr_table.insert(old_func, trunk_addr);
                         set_mem_writable(old_func, 4);
                         write_memory(old_func, &[0x00, 0x00, 0x20, 0xd4]);
                     } else {

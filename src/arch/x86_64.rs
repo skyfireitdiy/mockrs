@@ -73,7 +73,6 @@ extern "C" fn handle_trap_signal(_: i32, _: *mut siginfo_t, ucontext: *mut c_voi
         *G_TRUNK_ADDR_TABLE
             .lock()
             .unwrap()
-            .borrow()
             .get(&old_func)
             .unwrap()
     }
@@ -241,13 +240,12 @@ impl Mocker {
 
         {
             let mut addr_table = G_TRUNK_ADDR_TABLE.lock().unwrap();
-            if addr_table.get_mut().get(&old_func).is_none() {
+            if addr_table.get(&old_func).is_none() {
                 let ins_mem = read_memory(old_func, G_REPLACE_LEN).clone();
 
                 if let Some(ins) = disassemble_instruction(&ins_mem, old_func as u64) {
                     let current_position = G_CURRENT_POSITION.lock().unwrap();
                     addr_table
-                        .get_mut()
                         .insert(old_func, current_position.get());
                     save_old_instruction(&ins, current_position);
                     set_mem_writable(old_func, 1);
