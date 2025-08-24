@@ -129,112 +129,124 @@ extern "C" fn handle_trap_signal(_: i32, _: *mut siginfo_t, ucontext: *mut c_voi
     }
 }
 
+fn save_old_instruction(ins: &Instruction, current_position: MutexGuard<Cell<usize>>) {
+    let old_len = ins.len();
+    let mut replace_reg = Register::None;
+    let mut new_instruction = *ins;
+
+    if ins.is_ip_rel_memory_operand() {
+        replace_reg = get_replace_register(ins);
+        new_instruction = make_new_instruction(*ins, replace_reg);
+    }
+
+    let mut encoder = Encoder::new(64);
+    match encoder.encode(&new_instruction, ins.ip()) {
+        Ok(new_len) => {
+            if current_position.get() + 3 + new_len - *G_CODE_AREA.lock().unwrap().get_mut()
+                >= get_code_area_size()
+            {
+                panic!("Code area overflow");
+            }
+
+            write_memory(current_position.get(), &[old_len as u8]);
+            current_position.set(current_position.get() + 1);
+
+            write_memory(current_position.get(), &[new_len as u8]);
+            current_position.set(current_position.get() + 1);
+
+            write_memory(current_position.get(), &[replace_reg as u8]);
+            current_position.set(current_position.get() + 1);
+
+            write_memory(current_position.get(), &encoder.take_buffer());
+            current_position.set(current_position.get() + new_len);
+        }
+        Err(e) => {
+            println!("{}", e);
+            panic!("Failed to encode instruction block");
+        }
+    }
+}
+
+fn make_new_instruction(ins: Instruction, reg: Register) -> Instruction {
+    let mut bak_ins = ins;
+    if bak_ins.memory_base().is_ip() {
+        // For RIP-relative addressing, iced-x86 encodes the displacement as a 32-bit
+        // value relative to next_ip. After switching the base to a GPR whose value
+        // we set to next_ip in the signal handler, the displacement we must encode
+        // is EA - next_ip.
+        bak_ins.set_memory_base(reg);
+        bak_ins.set_memory_displacement64(
+            ins.memory_displacement64().overflowing_sub(ins.next_ip()).0,
+        );
+    }
+    bak_ins
+}
+
+fn get_replace_register(ins: &Instruction) -> Register {
+    // Prefer caller-saved registers per System V x86_64 ABI.
+    // Exclude any register (explicit or implicit) used by the instruction.
+    let candidates = [
+        Register::RAX,
+        Register::RCX,
+        Register::RDX,
+        Register::RSI,
+        Register::RDI,
+        Register::R8,
+        Register::R9,
+        Register::R10,
+        Register::R11,
+    ];
+    let mut info_factory = InstructionInfoFactory::new();
+    let info = info_factory.info(ins);
+    let used: Vec<Register> = info.used_registers().iter().map(|u| u.register()).collect();
+
+    *candidates
+        .iter()
+        .find(|&&r| !used.contains(&r))
+        .expect("No available caller-saved register to use for RIP-relative rewrite")
+}
+
+fn write_memory(addr: usize, data: &[u8]) {
+    unsafe {
+        std::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, data.len());
+    }
+}
+
+fn init_mock() {
+    G_INIT_FLAG.lock().unwrap().get_or_init(|| {
+        setup_trap_handler();
+        alloc_code_area();
+    });
+}
+
+fn setup_trap_handler() {
+    if let Err(err) = unsafe {
+        sigaction(
+            Signal::SIGTRAP,
+            &SigAction::new(
+                SigHandler::SigAction(handle_trap_signal),
+                SaFlags::SA_SIGINFO | SaFlags::SA_ONSTACK,
+                SigSet::empty(),
+            ),
+        )
+    } {
+        panic!("Failed to set signal handler: {:?}", err);
+    }
+}
+
 impl Mocker {
     pub fn mock(old_func: usize, new_func: usize) -> Mocker {
-        fn save_old_instruction(ins: &Instruction, current_position: MutexGuard<Cell<usize>>) {
-            let old_len = ins.len();
-            let mut replace_reg = Register::None;
-            let mut new_instruction = *ins;
 
-            if ins.is_ip_rel_memory_operand() {
-                replace_reg = get_replace_register(ins);
-                new_instruction = make_new_instruction(*ins, replace_reg);
-            }
 
-            let mut encoder = Encoder::new(64);
-            match encoder.encode(&new_instruction, ins.ip()) {
-                Ok(new_len) => {
-                    if current_position.get() + 3 + new_len - *G_CODE_AREA.lock().unwrap().get_mut()
-                        >= get_code_area_size()
-                    {
-                        panic!("Code area overflow");
-                    }
 
-                    write_memory(current_position.get(), &[old_len as u8]);
-                    current_position.set(current_position.get() + 1);
 
-                    write_memory(current_position.get(), &[new_len as u8]);
-                    current_position.set(current_position.get() + 1);
 
-                    write_memory(current_position.get(), &[replace_reg as u8]);
-                    current_position.set(current_position.get() + 1);
 
-                    write_memory(current_position.get(), &encoder.take_buffer());
-                    current_position.set(current_position.get() + new_len);
-                }
-                Err(e) => {
-                    println!("{}", e);
-                    panic!("Failed to encode instruction block");
-                }
-            }
-        }
 
-        fn make_new_instruction(ins: Instruction, reg: Register) -> Instruction {
-            let mut bak_ins = ins;
-            if bak_ins.memory_base().is_ip() {
-                // For RIP-relative addressing, iced-x86 encodes the displacement as a 32-bit
-                // value relative to next_ip. After switching the base to a GPR whose value
-                // we set to next_ip in the signal handler, the displacement we must encode
-                // is EA - next_ip.
-                bak_ins.set_memory_base(reg);
-                bak_ins.set_memory_displacement64(
-                    ins.memory_displacement64().overflowing_sub(ins.next_ip()).0,
-                );
-            }
-            bak_ins
-        }
 
-        fn get_replace_register(ins: &Instruction) -> Register {
-            // Prefer caller-saved registers per System V x86_64 ABI.
-            // Exclude any register (explicit or implicit) used by the instruction.
-            let candidates = [
-                Register::RAX,
-                Register::RCX,
-                Register::RDX,
-                Register::RSI,
-                Register::RDI,
-                Register::R8,
-                Register::R9,
-                Register::R10,
-                Register::R11,
-            ];
-            let mut info_factory = InstructionInfoFactory::new();
-            let info = info_factory.info(ins);
-            let used: Vec<Register> = info.used_registers().iter().map(|u| u.register()).collect();
 
-            *candidates
-                .iter()
-                .find(|&&r| !used.contains(&r))
-                .expect("No available caller-saved register to use for RIP-relative rewrite")
-        }
 
-        fn write_memory(addr: usize, data: &[u8]) {
-            unsafe {
-                std::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, data.len());
-            }
-        }
 
-        fn init_mock() {
-            G_INIT_FLAG.lock().unwrap().get_or_init(|| {
-                setup_trap_handler();
-                alloc_code_area();
-            });
-        }
-
-        fn setup_trap_handler() {
-            if let Err(err) = unsafe {
-                sigaction(
-                    Signal::SIGTRAP,
-                    &SigAction::new(
-                        SigHandler::SigAction(handle_trap_signal),
-                        SaFlags::SA_SIGINFO | SaFlags::SA_ONSTACK,
-                        SigSet::empty(),
-                    ),
-                )
-            } {
-                panic!("Failed to set signal handler: {:?}", err);
-            }
-        }
 
         init_mock();
 
