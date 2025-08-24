@@ -70,11 +70,7 @@ extern "C" fn handle_trap_signal(_: i32, _: *mut siginfo_t, ucontext: *mut c_voi
     }
 
     fn get_bak_instruction_addr(old_func: usize) -> usize {
-        *G_TRUNK_ADDR_TABLE
-            .lock()
-            .unwrap()
-            .get(&old_func)
-            .unwrap()
+        *G_TRUNK_ADDR_TABLE.lock().unwrap().get(&old_func).unwrap()
     }
 
     if !is_step_mode(eflags) {
@@ -236,18 +232,6 @@ fn setup_trap_handler() {
 
 impl Mocker {
     pub fn mock(old_func: usize, new_func: usize) -> Mocker {
-
-
-
-
-
-
-
-
-
-
-
-
         init_mock();
 
         {
@@ -257,8 +241,7 @@ impl Mocker {
 
                 if let Some(ins) = disassemble_instruction(&ins_mem, old_func as u64) {
                     let current_position = G_CURRENT_POSITION.lock().unwrap();
-                    addr_table
-                        .insert(old_func, current_position.get());
+                    addr_table.insert(old_func, current_position.get());
                     save_old_instruction(&ins, current_position);
                     set_mem_writable(old_func, 1);
                     write_memory(old_func, [0xcc].as_slice());

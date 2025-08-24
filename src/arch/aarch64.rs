@@ -7,17 +7,11 @@ use nix::{
 };
 use std::{cell::Cell, sync::MutexGuard};
 
-
-
 extern "C" fn handle_trap_signal(_: i32, _info: *mut siginfo_t, ucontext: *mut c_void) {
     let ctx = ucontext as *mut ucontext_t;
     let trap_addr = unsafe { (*ctx).uc_mcontext.pc as usize };
 
-    let trunk_addr_option = G_TRUNK_ADDR_TABLE
-        .lock()
-        .unwrap()
-        .get(&trap_addr)
-        .copied();
+    let trunk_addr_option = G_TRUNK_ADDR_TABLE.lock().unwrap().get(&trap_addr).copied();
 
     if let Some(trunk_addr) = trunk_addr_option {
         if is_current_thread_mocked(trap_addr) {
@@ -145,8 +139,6 @@ fn save_old_instruction(
         return trunk_addr;
     }
 
-
-
     let old_len = ins.bytes().len();
     let jump_back_len = 16;
 
@@ -211,7 +203,7 @@ fn save_old_instruction(
             new_bytes.extend_from_slice(&ldr_literal_xrd.to_le_bytes());
             // Insert a branch to skip over the inlined 8-byte literal
             new_bytes.extend_from_slice(&0x14000003_u32.to_le_bytes()); // B +12
-            // Inline the absolute page address literal
+                                                                        // Inline the absolute page address literal
             new_bytes.extend_from_slice(&target_page_addr.to_le_bytes());
 
             ins_bytes = new_bytes;
@@ -273,16 +265,22 @@ fn save_old_instruction(
         };
 
         // Temporarily disable LDR literal rewrites to avoid SIGILL under emulation; keep original bytes
-        let is_ldr_literal = false && ins.id() == InsnId(arm64::Arm64Insn::ARM64_INS_LDR as u32) && is_pc_mem;
-        let is_ldrsw_literal = false && ins.id() == InsnId(arm64::Arm64Insn::ARM64_INS_LDRSW as u32) && is_pc_mem;
+        let is_ldr_literal =
+            false && ins.id() == InsnId(arm64::Arm64Insn::ARM64_INS_LDR as u32) && is_pc_mem;
+        let is_ldrsw_literal =
+            false && ins.id() == InsnId(arm64::Arm64Insn::ARM64_INS_LDRSW as u32) && is_pc_mem;
 
         if is_ldr_literal || is_ldrsw_literal {
             // Extract destination register index and width, and compute absolute target address
-            let (rd_idx, rd_is_32) = if let capstone::arch::ArchOperand::Arm64Operand(op0) = &ops[0] {
+            let (rd_idx, rd_is_32) = if let capstone::arch::ArchOperand::Arm64Operand(op0) = &ops[0]
+            {
                 match op0.op_type {
                     capstone::arch::arm64::Arm64OperandType::Reg(r) => {
                         let name_opt = cs.reg_name(r);
-                        let is_w = name_opt.as_deref().map(|s| s.starts_with('w')).unwrap_or(false);
+                        let is_w = name_opt
+                            .as_deref()
+                            .map(|s| s.starts_with('w'))
+                            .unwrap_or(false);
                         (((r.0 as u32) & 0x1F), is_w)
                     }
                     _ => panic!("LDR literal dest is not a GPR"),
@@ -320,8 +318,7 @@ fn save_old_instruction(
                     } else {
                         0x58000000 // LDR Xt, #imm
                     };
-                    let ins_word: u32 =
-                        base | (((imm19 as u32) & 0x7FFFF) << 5) | (rd_idx & 0x1F);
+                    let ins_word: u32 = base | (((imm19 as u32) & 0x7FFFF) << 5) | (rd_idx & 0x1F);
                     new_bytes.extend_from_slice(&ins_word.to_le_bytes());
                     ins_bytes = new_bytes;
                     new_len = ins_bytes.len();

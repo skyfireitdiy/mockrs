@@ -19,8 +19,7 @@ pub struct Mocker {
 }
 
 lazy_static! {
-    pub static ref G_TRUNK_ADDR_TABLE: Mutex<HashMap<usize, usize>> =
-        Mutex::new(HashMap::new());
+    pub static ref G_TRUNK_ADDR_TABLE: Mutex<HashMap<usize, usize>> = Mutex::new(HashMap::new());
 }
 
 pub static G_REPLACE_LEN: usize = 16;
