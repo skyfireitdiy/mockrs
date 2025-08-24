@@ -2,7 +2,7 @@
 
 摘要
 
-mockrs 通过在运行时修改函数入口机器码并结合信号处理与线程本地存储（TLS），实现对任意函数（自由函数、具体方法、FFI 函数）的精确模拟，并在多线程环境中提供严格的线程隔离。相较传统基于 Trait 的模拟库，mockrs 不需要对生产代码进行接口化重构，适合集成测试与复杂边界场景。本文系统阐述问题背景、设计目标、架构与关键方案、实现细节、跨架构差异、工程化与测试、效果评估以及局限与展望。
+mockrs 通过在运行时修改函数入口机器码并结合信号处理与线程本地存储（TLS），实现对任意函数（自由函数、具体方法、FFI 函数）的精确模拟，并在多线程环境中提供严格的线程隔离。相较传统基于 Trait 的模拟库，mockrs 不需要对生产代码进行接口化重构，适合集成测试与复杂边界场景。本文系统阐述问题背景、设计目标、顶层模型与可行性、关键方案、实现细节、跨架构差异、工程化与测试、效果评估以及局限与展望。
 
 ---
 
@@ -63,7 +63,7 @@ fn main() {
 
 ---
 
-## 2. 核心思路与顶层模型
+## 2. 顶层模型与可行性
 
 ### 2.1 核心思路
 
@@ -107,118 +107,63 @@ end note
 @enduml
 ```
 
-### 2.3 设计原则
+### 2.3 高阶架构图
+
+```plantuml
+@startuml
+title mockrs 方案高阶架构图
+
+skinparam rectangle {
+    roundCorner 25
+}
+skinparam database {
+    roundCorner 25
+}
+
+package "用户代码" {
+    [线程 A]
+    [线程 B]
+}
+
+package "共享内存空间" {
+    rectangle "函数 F 的代码" as FuncF {
+        rectangle "陷阱指令 (int3 / brk)" as Trap
+    }
+    database "全局信号处理器" as SignalHandler
+}
+
+package "线程 A 本地存储 (TLS)" {
+    database "模拟表 A\n(F -> M1)" as TLSA
+}
+
+package "线程 B 本地存储 (TLS)" {
+    database "模拟表 B\n(空)" as TLSB
+}
+
+
+[线程 A] --> Trap : A.1. 调用函数 F
+Trap -> SignalHandler : A.2. 触发 SIGTRAP
+SignalHandler -> TLSA : A.3. 查询线程A的模拟表
+TLSA --> SignalHandler : A.4. 发现模拟函数 M1
+SignalHandler --> [模拟函数 M1] : A.5. 重定向执行流
+
+[线程 B] --> Trap : B.1. 调用函数 F
+Trap -> SignalHandler : B.2. 触发 SIGTRAP
+SignalHandler -> TLSB : B.3. 查询线程B的模拟表
+TLSB --> SignalHandler : B.4. 未发现模拟
+SignalHandler --> [执行原始指令\n(通过蹦床)] : B.5. 重定向执行流
+
+@enduml
+```
+
+### 2.4 设计原则
 
 - 最小侵入：仅修改函数入口处字节
 - 可证恢复：未模拟线程路径具备确定性和可验证的恢复流程
 - 架构适配：针对 x86_64 与 aarch64 的指令集特性分别采用最稳健机制
 - 工程可用：提供 CI 与 aarch64 交叉测试保障
 
-### 2.4 与 Trait 模拟的差异对比
-
-| 维度 | Trait 模拟 | mockrs |
-| --- | --- | --- |
-| 改造成本 | 常需为可测试性重构生产代码（抽象接口、依赖注入）。 | 直接作用于已存在的自由函数/具体实现，无需为测试重构设计。 |
-| 可模拟对象 | 以接口为中心，难以覆盖自由函数与部分 FFI。 | 自由函数、具体方法、FFI 均可（前提是有可寻址入口）。 |
-| 线程隔离 | 通常为进程级替换，难以自然隔离线程。 | TLS 驱动的线程级生效，天然支持并发测试的相互独立。 |
-| API 复杂度 | 需要定义/实现 Trait，配置期望与行为。 | 一个 mock! 宏即可完成替换，RAII 自动恢复。 |
-| 典型场景 | 单元测试、面向接口的业务逻辑隔离。 | 集成测试、边界条件/自由函数/FFI/系统调用包装等难以接口化的路径。 |
-
-### 2.5 具体局限性示例：为什么仅有 Trait Mock 与非线程独立 Mock 不够
-
-#### 2.5.1 基于 Trait 的 Mock 的局限性（示例）
-
-- 场景 A：自由函数/FFI 难以通过接口注入
-  - 现状：许多现存代码直接调用自由函数或 FFI，例如 std::fs::read_to_string、libc::gettimeofday/clock_gettime、自定义 util::now() 等。
-  - 典型业务代码：
-    ```rust
-    mod lib {
-        pub fn read_token() -> String {
-            std::fs::read_to_string("/secure/token").unwrap()
-        }
-    }
-
-    pub fn business() -> bool {
-        let t = lib::read_token();
-        t.trim() == "prod"
-    }
-    ```
-  - 若用 Trait Mock，需要为可测试性重写设计，引入接口与依赖注入：
-    ```rust
-    pub trait TokenReader {
-        fn read_token(&self) -> String;
-    }
-
-    pub struct Real;
-    impl TokenReader for Real {
-        fn read_token(&self) -> String {
-            std::fs::read_to_string("/secure/token").unwrap()
-        }
-    }
-
-    pub fn business<R: TokenReader>(r: &R) -> bool {
-        let t = r.read_token();
-        t.trim() == "prod"
-    }
-    ```
-  - 问题：
-    - 扩散式改动：business 的签名变化会沿调用栈层层传递，影响大量文件与模块。
-    - 第三方/FFI 不可控：对于外部 crate 或 C 接口，无法强制其改为 Trait 暴露，更无法修改其调用点。
-    - API 稳定性受损：为了测试引入的 Trait/泛型约束，改变了对外 API 与类型边界，增加维护复杂度。
-    - 设计被测试绑架：把“可测试性”要求强加到生产代码，违背最小侵入原则。
-
-- 场景 B：静态/关联函数、具体实现难以抽象
-  - 例如某具体类型的关联函数 T::connect() 或全局初始化函数 init_logging()，若非预先以 Trait 抽象，事后很难安全地改为依赖注入；即便能改，也需要跨层接口调整与生命周期/Send/Sync 约束处理，成本与风险都很高。
-
-- mockrs 的解法：
-  - 直接在运行时替换这些自由函数/具体实现的入口，无需改动被测代码设计；测试结束自动恢复，保持生产代码纯净。
-
-#### 2.5.2 非线程独立的 Mock 的局限性（以 mockcpp 为例）
-
-- 背景：传统 C/C++ 打桩方案（以 mockcpp 等为代表）常通过对全局符号的进程级替换来实现自由函数模拟。这类替换通常是“全局生效”的：一旦设桩，整个进程内所有线程都会看到被替换后的行为。
-
-- 并发下的典型问题（伪代码示例，展示现象而非特定 API）：
-  ```cpp
-  // 真实实现：f() 返回 0
-  int f();
-
-  // 线程 A 希望把 f() 桩成返回 1
-  void threadA() {
-      set_global_stub(f, [](){ return 1; }); // 进程级生效
-      EXPECT_EQ(f(), 1);                      // 通过
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
-      clear_global_stub(f);
-  }
-
-  // 线程 B 希望调用真实 f()
-  void threadB() {
-      // 期望：真实行为
-      EXPECT_EQ(f(), 0);                      // 可能失败：被 A 的全局桩污染
-  }
-
-  int main() {
-      std::thread A(threadA);
-      std::thread B(threadB);
-      A.join(); B.join();
-  }
-  ```
-  - 现象：
-    - 污染：线程 B 在 A 的桩有效期间也会命中桩，预期与实际不一致。
-    - 竞态：若 B 在 A 清桩的同时执行 f()，可能出现未定义行为或间歇性失败。
-    - 难以并行：为了避免互相污染，只能串行化测试或使用复杂同步，降低测试吞吐量。
-
-- mockcpp 一类“进程级打桩”方案的局限性总结：
-  - 缺乏线程隔离：替换范围是进程级而非线程级，不能满足“同进程多场景并行”的测试需求。
-  - 全局状态竞争：桩的安装/卸载与被测代码的多线程调用相互交织，容易产生数据竞争与时序问题。
-  - 复杂的用例下难以维护：需要额外同步与测试编排来规避污染，成本高且脆弱。
-
-- mockrs 的对照优势：
-  - 替换记录保存在 TLS，仅对创建桩的线程生效；其他线程走“蹦床 + 恢复”路径，始终执行真实实现。
-  - 无需跨线程同步与封锁即可并行跑不同场景的测试；RAII 生命周期自动恢复，降低误用概率。
-
----
-
-## 3. Linux 信号处理流程与寄存器修改可行性
+### 2.5 Linux 信号处理与寄存器修改可行性
 
 利用 Linux 的信号处理机制（sigaction + SA_SIGINFO），用户态信号处理器可在接收 SIGTRAP 时直接读取并修改 ucontext_t 中保存的寄存器快照（如 x86_64 的 RIP/EFLAGS、aarch64 的 PC/X 寄存器）。当信号处理器返回时，内核依据该上下文恢复用户态寄存器，因而“修改后的寄存器值立即生效”，从而实现执行流重定向。这一机制是 mockrs 基于陷阱指令在用户态完成“跳转到模拟函数”或“切入蹦床”的可行性根基。
 
@@ -271,123 +216,141 @@ stop
 
 ---
 
-## 4. 架构与执行流程总览
+## 3. 与 Trait 模拟的差异与动机细化
 
-### 4.1 高阶架构图
+### 3.1 差异对比
 
-```plantuml
-@startuml
-title mockrs 方案高阶架构图
+| 维度 | Trait 模拟 | mockrs |
+| --- | --- | --- |
+| 改造成本 | 常需为可测试性重构生产代码（抽象接口、依赖注入）。 | 直接作用于已存在的自由函数/具体实现，无需为测试重构设计。 |
+| 可模拟对象 | 以接口为中心，难以覆盖自由函数与部分 FFI。 | 自由函数、具体方法、FFI 均可（前提是有可寻址入口）。 |
+| 线程隔离 | 通常为进程级替换，难以自然隔离线程。 | TLS 驱动的线程级生效，天然支持并发测试的相互独立。 |
+| API 复杂度 | 需要定义/实现 Trait，配置期望与行为。 | 一个 mock! 宏即可完成替换，RAII 自动恢复。 |
+| 典型场景 | 单元测试、面向接口的业务逻辑隔离。 | 集成测试、边界条件/自由函数/FFI/系统调用包装等难以接口化的路径。 |
 
-skinparam rectangle {
-    roundCorner 25
-}
-skinparam database {
-    roundCorner 25
-}
+### 3.2 具体局限性示例：为什么仅有 Trait Mock 与非线程独立 Mock 不够
 
-package "用户代码" {
-    [线程 A]
-    [线程 B]
-}
+#### 3.2.1 基于 Trait 的 Mock 的局限性（示例）
 
-package "共享内存空间" {
-    rectangle "函数 F 的代码" as FuncF {
-        rectangle "陷阱指令 (int3 / brk)" as Trap
+- 场景 A：自由函数/FFI 难以通过接口注入
+  - 现状：许多现存代码直接调用自由函数或 FFI，例如 std::fs::read_to_string、libc::gettimeofday/clock_gettime、自定义 util::now() 等。
+  - 典型业务代码：
+    ```rust
+    mod lib {
+        pub fn read_token() -> String {
+            std::fs::read_to_string("/secure/token").unwrap()
+        }
     }
-    database "全局信号处理器" as SignalHandler
-}
 
-package "线程 A 本地存储 (TLS)" {
-    database "模拟表 A\n(F -> M1)" as TLSA
-}
+    pub fn business() -> bool {
+        let t = lib::read_token();
+        t.trim() == "prod"
+    }
+    ```
+  - 若用 Trait Mock，需要为可测试性重写设计，引入接口与依赖注入：
+    ```rust
+    pub trait TokenReader {
+        fn read_token(&self) -> String;
+    }
 
-package "线程 B 本地存储 (TLS)" {
-    database "模拟表 B\n(空)" as TLSB
-}
+    pub struct Real;
+    impl TokenReader for Real {
+        fn read_token(&self) -> String {
+            std::fs::read_to_string("/secure/token").unwrap()
+        }
+    }
 
+    pub fn business<R: TokenReader>(r: &R) -> bool {
+        let t = r.read_token();
+        t.trim() == "prod"
+    }
+    ```
+  - 问题：
+    - 扩散式改动：business 的签名变化会沿调用栈层层传递，影响大量文件与模块。
+    - 第三方/FFI 不可控：对于外部 crate 或 C 接口，无法强制其改为 Trait 暴露，更无法修改其调用点。
+    - API 稳定性受损：为了测试引入的 Trait/泛型约束，改变了对外 API 与类型边界，增加维护复杂度。
+    - 设计被测试绑架：把“可测试性”要求强加到生产代码，违背最小侵入原则。
 
-[线程 A] --> Trap : A.1. 调用函数 F
-Trap -> SignalHandler : A.2. 触发 SIGTRAP
-SignalHandler -> TLSA : A.3. 查询线程A的模拟表
-TLSA --> SignalHandler : A.4. 发现模拟函数 M1
-SignalHandler --> [模拟函数 M1] : A.5. 重定向执行流
+- 场景 B：静态/关联函数、具体实现难以抽象
+  - 例如某具体类型的关联函数 T::connect() 或全局初始化函数 init_logging()，若非预先以 Trait 抽象，事后很难安全地改为依赖注入；即便能改，也需要跨层接口调整与生命周期/Send/Sync 约束处理，成本与风险都很高。
 
-[线程 B] --> Trap : B.1. 调用函数 F
-Trap -> SignalHandler : B.2. 触发 SIGTRAP
-SignalHandler -> TLSB : B.3. 查询线程B的模拟表
-TLSB --> SignalHandler : B.4. 未发现模拟
-SignalHandler --> [执行原始指令\n(通过蹦床)] : B.5. 重定向执行流
+- mockrs 的解法：
+  - 直接在运行时替换这些自由函数/具体实现的入口，无需改动被测代码设计；测试结束自动恢复，保持生产代码纯净。
 
-@enduml
-```
+#### 3.2.2 非线程独立的 Mock 的局限性（以 mockcpp 为例）
 
-### 4.2 线程隔离的核心
+- 背景：传统 C/C++ 打桩方案（以 mockcpp 等为代表）常通过对全局符号的进程级替换来实现自由函数模拟。这类替换通常是“全局生效”的：一旦设桩，整个进程内所有线程都会看到被替换后的行为。
 
-- TLS（thread_local!）为每个线程提供独立的 G_THREAD_REPLACE_TABLE：RefCell<HashMap<usize, Vec<usize>>>
-- RAII 模式支持嵌套 mock：每线程对同一函数可形成“模拟栈”
-- 全局状态最小化：仅维护 G_TRUNK_ADDR_TABLE: Mutex<HashMap<usize, usize>>
+- 并发下的典型问题（伪代码示例，展示现象而非特定 API）：
+  ```cpp
+  // 真实实现：f() 返回 0
+  int f();
 
-### 4.3 设计考虑（线程隔离）
+  // 线程 A 希望把 f() 桩成返回 1
+  void threadA() {
+      set_global_stub(f, [](){ return 1; }); // 进程级生效
+      EXPECT_EQ(f(), 1);                      // 通过
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      clear_global_stub(f);
+  }
 
-- 线程本地存储（TLS）优先：避免锁竞争与伪共享
-- RAII 与嵌套支持：Mocker Drop 时在本线程出栈并清理
-- 信号处理器无锁与可重入：仅读 TLS，原子式寄存器调整
-- 失败隔离：未模拟线程透明走“蹦床 + 恢复”路径
+  // 线程 B 希望调用真实 f()
+  void threadB() {
+      // 期望：真实行为
+      EXPECT_EQ(f(), 0);                      // 可能失败：被 A 的全局桩污染
+  }
+
+  int main() {
+      std::thread A(threadA);
+      std::thread B(threadB);
+      A.join(); B.join();
+  }
+  ```
+  - 现象：
+    - 污染：线程 B 在 A 的桩有效期间也会命中桩，预期与实际不一致。
+    - 竞态：若 B 在 A 清桩的同时执行 f()，可能出现未定义行为或间歇性失败。
+    - 难以并行：为了避免互相污染，只能串行化测试或使用复杂同步，降低测试吞吐量。
+
+- mockcpp 一类“进程级打桩”方案的局限性总结：
+  - 缺乏线程隔离：替换范围是进程级而非线程级，不能满足“同进程多场景并行”的测试需求。
+  - 全局状态竞争：桩的安装/卸载与被测代码的多线程调用相互交织，容易产生数据竞争与时序问题。
+  - 复杂的用例下难以维护：需要额外同步与测试编排来规避污染，成本高且脆弱。
+
+- mockrs 的对照优势：
+  - 替换记录保存在 TLS，仅对创建桩的线程生效；其他线程走“蹦床 + 恢复”路径，始终执行真实实现。
+  - 无需跨线程同步与封锁即可并行跑不同场景的测试；RAII 生命周期自动恢复，降低误用概率。
 
 ---
 
-## 5. 关键挑战与解决方案
+## 4. 关键挑战与解决方案
 
 我们面临五个关键问题：权限（可写）、劫持（拦截执行流）、隔离（线程粒度生效）、重定位（PC 相对修复）、恢复（精确跳回）。以下给出整体解法。
 
-### 5.1 权限与劫持：mprotect + 陷阱指令
+### 4.1 权限与劫持：mprotect + 陷阱指令
 
 - 使用 nix::mprotect 在运行时将目标页权限临时改为 RWX
 - 在函数入口写入陷阱指令（x86_64 上的 int3，aarch64 上的 brk）
 - 将被覆盖的第一条原始指令备份到“蹦床”
 
-### 5.2 执行路径分发与线程隔离
+### 4.2 执行路径分发与线程隔离
 
 - 全局信号处理器根据 TLS 判定：有模拟则重定向至新函数，无则执行蹦床中的原始指令
 
-### 5.3 精确恢复（x86_64 单步；aarch64 一次跳回）
+### 4.3 精确恢复（x86_64 单步；aarch64 一次跳回）
 
 - x86_64：设置 EFLAGS.TF 进入单步模式，仅执行蹦床中一条重写指令，第二次 SIGTRAP 负责清除 TF、恢复寄存器并跳回 orig+len
 - aarch64：不使用单步；蹦床包含“原始/重写指令 + 绝对跳回”，一次 SIGTRAP 即引导并返回
 
-### 5.4 重定位（指令重写）
+### 4.4 重定位（指令重写）
 
 - x86_64：iced-x86 识别 RIP 相对寻址，挑选未使用的 caller-saved 寄存器作为“桥接寄存器”；在信号处理器中临时写入 next_ip 并执行重写后的指令
 - aarch64：对 B/BL 等分支生成“LDR X17, #8; BR/BLR X17; <绝对地址>”；对 ADRP/ADR 在蹦床 PC 重编码或回退到“字面量装载 + 跳转/使用”；必要时对 literal LDR 采用保守序列避免 SIGILL
 
 ---
 
-## 6. 平台差异与原因
+## 5. 执行流程总览与细化
 
-### 6.1 x86_64 与 aarch64 的差异（概览）
-
-- 入口陷阱：int3（1B） vs brk（4B）
-- 未模拟路径：x86_64 两次 SIGTRAP 的单步恢复 vs aarch64 一次 SIGTRAP 的直接跳回
-- 蹦床组织：x86_64 变长指令 + 3B 头；aarch64 4B 对齐 + 跳回序列 + 字面量地址
-- 指令重写：寄存器桥接 vs 绝对地址序列/重编码
-- 临时寄存器：动态选择 caller-saved vs 固定 X17
-- I-Cache：通常无需显式刷新 vs 需要 dsb sy + ic ivau + isb
-- 性能形态：精确单步（两次陷阱） vs 确定性跳回（一次陷阱）
-- 兼容性：x86_64 倚重成熟单步；aarch64 强调对齐与缓存维护的保守策略
-
-### 6.2 原因分析
-
-- ISA 差异导致断点指令长度、PC 相对编码与重写成本不同
-- x86 I/D cache 一致性由硬件保障；ARM 对自修改代码要求显式缓存维护
-- 平台约定（如 X17 用作跳转寄存器）与 ABI 差异影响临时寄存器选择
-- 调试能力差异决定了单步/跳回的可移植性与稳健性
-
----
-
-## 7. 执行流程细化
-
-### 7.1 x86_64 核心执行流程
+### 5.1 x86_64 核心执行流程
 
 ```plantuml
 @startuml
@@ -441,7 +404,7 @@ stop
 - 概念：在第二次 SIGTRAP（单步执行完蹦床中的一条指令后）返回前，信号处理器检查是否“顺序落回”蹦床指令末端，即判断 RIP 是否等于 trunk_addr+3+new_len。若不相等，说明该指令改变了控制流（如 jmp/call/jcc/ret 等），此时不再将 RIP 写回 orig_addr+old_len，而是保留当前 RIP，让执行沿已发生的跳转继续，避免将已跳走的控制流强行拉回原函数。
 - 代码对应：条件判断 if rip - (trunk_addr + 3) == new_len 成立才执行写回，否则触发“写回抑制”。
 
-#### 7.1.1 当函数首条指令为跳转（jmp/call/jcc）时的行为（x86_64）
+#### 5.1.1 当函数首条指令为跳转（jmp/call/jcc）时的行为（x86_64）
 
 - 背景：当前 x86_64 的实现仅对“RIP 相对的内存操作数”进行重写与桥接（见源码中 Instruction::is_ip_rel_memory_operand 的分支），不会重写“以立即数编码的相对控制流”（如 JMP rel8/rel32、CALL rel32、Jcc rel8/rel32）。
 - 流程回顾（未命中模拟路径时）：
@@ -469,7 +432,7 @@ stop
   - 在第二次 SIGTRAP 中会先恢复被暂借的寄存器（replace_reg），确保寄存器语义不被破坏；RIP 的写回仅受上述“顺序落回”判定控制。
   - 该设计确保：顺序执行路径得到精确恢复；而发生跳转时不会被错误地拉回原函数，从而保持与原地执行一致的控制流。
 
-### 7.2 aarch64 核心执行流程
+### 5.2 aarch64 核心执行流程
 
 ```plantuml
 @startuml
@@ -504,50 +467,72 @@ stop
 @enduml
 ```
 
-#### 7.2.1 为什么 aarch64 没有单步/写回抑制机制？是否不需要？
+#### 5.2.1 为什么 aarch64 没有单步/写回抑制机制？是否不需要？
 
 - 设计选择：aarch64 路径采用“一次 SIGTRAP + 自包含蹦床”的确定性流程，不依赖单步。信号处理器只负责把 PC 指向蹦床：
   - 若首条是分支（B/BL/B.cond 等）：在 save_old_instruction 的分支处理路径中，会将相对分支重写为“LDR X17, #8; BR/BLR X17; <绝对目标地址>”，直接跳向真实目标，不再返回原函数入口。这等价于 x86_64 中“RIP 已被改写则不写回”的效果，但由蹦床自身保证，无需在信号返回时再做判断。
   - 若首条为非分支：蹦床末尾固定附加“LDR Xt, #8; BR Xt; <orig+len>”的跳回序列，执行完原始/重写指令后自动回到 orig+len 继续，无需第二次 SIGTRAP。
 - 为什么不实现单步：
   - 可用性与复杂度：x86_64 通过 EFLAGS.TF 可直接进入单步；aarch64 的单步需要操作调试状态（如 PSTATE.SS/调试寄存器）并通常经由 ptrace 等机制，在信号处理器内启停不如 x86 简便、可移植。
-  - ISA 特性：aarch64 指令定长 4 字节，易于在蹦床中构造“绝对跳转/跳回”序列；相对分支与 PC 相对访问可以在蹦床处重编码或改为“装载绝对地址 + 间接跳转/访问”，因此无需依赖单步去“原位执行”。
+  - ISA 特性：aarch64 指令定长 4 字节，易于在蹦床中构造“绝对跳转/跳回”序列；相对分支与 PC 相对访问可以在蹦床处重编码或改为“装载绝对地址 + 间接跳转/使用”，因此无需依赖单步去“原位执行”。
   - 稳健性与兼容：一次 SIGTRAP 避免两次陷阱带来的时序/嵌套信号问题；在 QEMU 等仿真环境更稳定。实现中也配套执行 I-Cache 刷新，保证自修改代码一致性。
   - 性能：单次陷阱比两次陷阱更低开销。
 - 是否不需要：是。由于蹦床已分别对“分支”和“非分支”路径提供了精确的前进/回跳语义，aarch64 不需要在信号返回时做“写回抑制”判断；控制流转移由蹦床指令序列直接体现。
 
 ---
 
-## 8. 实现细节
+## 6. 平台差异与原因
 
-### 8.1 关键数据结构
+### 6.1 x86_64 与 aarch64 的差异（概览）
+
+- 入口陷阱：int3（1B） vs brk（4B）
+- 未模拟路径：x86_64 两次 SIGTRAP 的单步恢复 vs aarch64 一次 SIGTRAP 的直接跳回
+- 蹦床组织：x86_64 变长指令 + 3B 头；aarch64 4B 对齐 + 跳回序列 + 字面量地址
+- 指令重写：寄存器桥接 vs 绝对地址序列/重编码
+- 临时寄存器：动态选择 caller-saved vs 固定 X17
+- I-Cache：通常无需显式刷新 vs 需要 dsb sy + ic ivau + isb
+- 性能形态：精确单步（两次陷阱） vs 确定性跳回（一次陷阱）
+- 兼容性：x86_64 倚重成熟单步；aarch64 强调对齐与缓存维护的保守策略
+
+### 6.2 原因分析
+
+- ISA 差异导致断点指令长度、PC 相对编码与重写成本不同
+- x86 I/D cache 一致性由硬件保障；ARM 对自修改代码要求显式缓存维护
+- 平台约定（如 X17 用作跳转寄存器）与 ABI 差异影响临时寄存器选择
+- 调试能力差异决定了单步/跳回的可移植性与稳健性
+
+---
+
+## 7. 实现细节
+
+### 7.1 关键数据结构
 
 - 全局蹦床地址表：G_TRUNK_ADDR_TABLE: Mutex<HashMap<usize, usize>>（原函数入口 -> 蹦床地址）
 - 线程本地模拟表：G_THREAD_REPLACE_TABLE: thread_local RefCell<HashMap<usize, Vec<usize>>>（原函数 -> 模拟函数栈）
 - 作用域恢复：Mocker 的 Drop 在本线程内出栈并清理
 
-### 8.2 代码区与内存管理
+### 7.2 代码区与内存管理
 
 - 通过 mmap 分配可读/写/执行的“代码区”作为蹦床区域
 - 默认容量：8 页（PAGE_SIZE=4096），可通过环境变量 MOCKRS_CODE_AREA_SIZE_IN_PAGE 调整
 - Droper 的 Drop 在进程退出时 munmap 回收
 
-### 8.3 内存权限
+### 7.3 内存权限
 
 - 写入函数入口或蹦床时，使用 mprotect 临时修改目标页权限为 RWX
 - aarch64 场景下，每次写入后执行 dsb sy + ic ivau + isb 刷新指令缓存
 
-### 8.4 蹦床格式
+### 7.4 蹦床格式
 
 - x86_64：3 字节头（old_len/new_len/replace_reg）+ 重写后的单条指令；指令变长，无固定对齐
 - aarch64：3 字节头 + 4 字节对齐填充 + 重写指令序列 + 跳回指令 + 8 字节字面量地址
 
-### 8.5 指令重写策略
+### 7.5 指令重写策略
 
 - x86_64：iced-x86 解析 RIP 相对寻址，动态选择 caller-saved 寄存器作为桥接，信号路径内负责寄存器保存/恢复
 - aarch64：对分支/PC 相对指令进行重编码或使用“LDR X17 + BR/BLR + 字面量地址”的保守序列；在仿真环境下优先稳健方案避免 SIGILL
 
-#### 8.5.1 x86_64 临时寄存器（桥接寄存器）设计
+#### 7.5.1 x86_64 临时寄存器（桥接寄存器）设计
 
 - 设计目标：当首条指令含 RIP 相对的内存操作数（如 mov rax, [rip+disp]）时，需在“蹦床地址”正确取数。做法是把该内存基址从 RIP 改写为一个“临时寄存器 r_tmp”，并在信号路径中临时把 r_tmp 设为 next_ip（orig_addr + old_len），使 [r_tmp + disp’] 与原地等价。
 - 候选集合（遵循 System V x86_64 ABI 的 caller-saved）：{ RAX, RCX, RDX, RSI, RDI, R8, R9, R10, R11 }。
@@ -598,7 +583,7 @@ stop
 @enduml
 ```
 
-### 8.6 核心技术栈
+### 7.6 核心技术栈
 
 - nix：封装 POSIX 系统调用
 - lazy_static：安全初始化全局静态数据
@@ -606,7 +591,7 @@ stop
 
 ---
 
-## 9. 使用约束与最佳实践
+## 8. 使用约束与最佳实践
 
 - 函数签名需匹配：模拟函数参数与返回值应与原函数一致。
 - 内联与可挂钩性：被完全内联的函数没有独立入口，无法挂钩；测试中可临时标注 #[inline(never)]。
@@ -619,7 +604,7 @@ stop
 
 ---
 
-## 10. 工程化与测试
+## 9. 工程化与测试
 
 - CI 跨架构验证：仓库提供 GitHub Actions 工作流，除常规 x86_64 编译/测试外，还通过 qemu-user-static 在 Ubuntu 上透明执行 aarch64 目标二进制，并使用 aarch64-linux-gnu 工具链进行交叉编译与链接。关键步骤：
   - 安装 qemu-user-static 和 binfmt-support，并启用 qemu-aarch64
@@ -634,7 +619,7 @@ stop
 
 ---
 
-## 11. 效果评估
+## 10. 效果评估
 
 - 通用性：实现“万物皆可模拟”，覆盖自由函数、具体方法与 FFI 场景
 - 低侵入性：无需为测试重构生产代码（如强行引入 Trait）
@@ -643,15 +628,15 @@ stop
 
 ---
 
-## 12. 局限性与未来展望
+## 11. 局限性与未来展望
 
-### 12.1 当前局限性
+### 11.1 当前局限性
 
 - 性能开销：每次调用都会触发 SIGTRAP，开销高于常规调用；不适合性能极致场景
 - 无法模拟被完全内联的函数：编译器内联后缺失独立入口，无法挂钩
 - 极短函数/特殊布局：若入口替换不安全，则可能失败（实践中罕见）
 
-### 12.2 未来展望
+### 11.2 未来展望
 
 - 性能优化：探索更高效的蹦床技术（如按需写回，减少后续陷阱）
 - 更广平台：扩展到更多 CPU 架构与系统（含 32 位与 Windows）
@@ -659,14 +644,14 @@ stop
 
 ---
 
-## 13. 安全与合规说明
+## 12. 安全与合规说明
 
 - 代码区与目标页以 RWX 方式写入，适用于测试与开发环境；生产环境需充分评估风险与合规性
 - aarch64 下自修改代码需严格执行 I-Cache 刷新序列
 
 ---
 
-## 14. 结论
+## 13. 结论
 
 mockrs 以“全局提问、线程本地回答”为核心思想，通过最小侵入的入口陷阱与稳健的架构适配，解决了传统基于 Trait 的模拟方案无法触及的自由函数/FFI 等场景，并在多线程条件下提供可证的隔离与恢复能力。该方案为 Rust 的复杂测试需求提供了强大而务实的工具基础。
 
