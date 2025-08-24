@@ -62,6 +62,7 @@ impl Mocker {
                         addr_table.insert(old_func, trunk_addr);
                         set_mem_writable(old_func, 4);
                         write_memory(old_func, &[0x00, 0x00, 0x20, 0xd4]);
+                        set_mem_rx(old_func, 4);
                     } else {
                         panic!("Failed to disassemble instruction at 0x{old_func:x}");
                     }

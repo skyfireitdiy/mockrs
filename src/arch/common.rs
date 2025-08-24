@@ -137,3 +137,16 @@ pub fn set_mem_writable(old_func: usize, len: usize) {
         .unwrap()
     };
 }
+
+/// 设置内存为只读且可执行（恢复执行期的安全权限）
+pub fn set_mem_rx(old_func: usize, len: usize) {
+    let (low, high) = get_page_bound(old_func, len);
+    unsafe {
+        mprotect(
+            NonNull::new(low as *mut c_void).unwrap(),
+            high - low,
+            ProtFlags::PROT_READ | ProtFlags::PROT_EXEC,
+        )
+        .unwrap()
+    };
+}

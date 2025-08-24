@@ -250,6 +250,7 @@ impl Mocker {
                     save_old_instruction(&ins, current_position);
                     set_mem_writable(old_func, 1);
                     write_memory(old_func, [0xcc].as_slice());
+                    set_mem_rx(old_func, 1);
                 } else {
                     panic!("Failed to disassemble instruction at 0x{:x}", old_func);
                 }
