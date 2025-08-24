@@ -114,7 +114,7 @@ fn save_old_instruction(
             // BR X17, for B, B.cond etc.
             new_bytes.extend_from_slice(&0xd61f0220_u32.to_le_bytes());
         }
-        new_bytes.extend_from_slice(&target_addr.to_le_bytes());
+        new_bytes.extend_from_slice(&(target_addr as u64).to_le_bytes());
 
         let old_len = ins.bytes().len();
         let new_len = new_bytes.len();

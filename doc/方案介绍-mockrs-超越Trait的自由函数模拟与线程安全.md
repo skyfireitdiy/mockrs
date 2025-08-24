@@ -190,7 +190,7 @@ partition "用户态信号处理器" {
     :可按需调整栈/寄存器（通常无需）;
   else (否)
     :读取 ucontext;
-    :x86_64: 设置 EFLAGS.TF 进入单步; 将 RIP 指向“蹦床”指令处;
+    :x86_64: 将 RIP 指向“蹦床”主体起始（trunk_addr+3）;
     :aarch64: 将 PC 指向“蹦床”地址（蹦床自带跳回/跳转逻辑）;
   endif
 }
@@ -205,11 +205,10 @@ stop
 
 关键事实（可行性证明）：
 - 用户可写的寄存器上下文：使用 sigaction 注册 SA_SIGINFO 处理器后，第三个参数为 void*，在 glibc 下可转为 ucontext_t*。通过 uc_mcontext 可直接读写通用寄存器与标志位：
-  - x86_64：如 gregs[REG_RIP]、gregs[REG_EFL]（EFLAGS），可将 RIP 改为模拟函数地址，或设置 TF 标志位实现单步。
+  - x86_64：如 gregs[REG_RIP]、gregs[REG_EFL]（EFLAGS），可将 RIP 改为模拟函数地址。
   - aarch64：如 uc_mcontext.pc、uc_mcontext.regs[Xn]，可将 PC 改为蹦床/模拟函数地址；按需使用 X17 作为跳转寄存器。
 - 修改当次返回点：信号处理器返回后，内核按 sigframe 恢复寄存器；因此“在处理器返回用户态前修改寄存器”即可无 syscalls 地改变后续执行流，确保低开销与确定性。
 - 线程隔离天然成立：信号由触发陷阱的“当前线程”接收与处理，结合 TLS 决策，仅影响当前线程；其他线程即使执行同一函数，也会独立经由各自的 TLS 与处理器路径。
-- 调试辅助能力：x86_64 可通过写 EFLAGS.TF 进入单步，精确控制“仅执行蹦床中的一条指令”，第二次 SIGTRAP 再进行恢复/写回抑制；aarch64 借助定长指令与保守的“绝对跳转/跳回”序列避免对单步的依赖。
 - 工程建议：
   - 使用 sigaction(..., SA_SIGINFO | SA_RESTART | SA_ONSTACK, ...) 提升健壮性；可在高栈消耗场景配置 sigaltstack 作为信号栈。
   - 仅在测试/开发环境使用该机制（涉及 RWX 与自修改代码）；aarch64 需在写入后执行 dsb sy + ic ivau + isb 刷新 I-Cache。
@@ -336,10 +335,14 @@ stop
 
 - 全局信号处理器根据 TLS 判定：有模拟则重定向至新函数，无则执行蹦床中的原始指令
 
-### 4.3 精确恢复（x86_64 单步；aarch64 一次跳回）
+### 4.3 精确恢复：一次 SIGTRAP + 自包含蹦床（x86_64 / aarch64）
 
-- x86_64：设置 EFLAGS.TF 进入单步模式，仅执行蹦床中一条重写指令，第二次 SIGTRAP 负责清除 TF、恢复寄存器并跳回 orig+len
-- aarch64：不使用单步；蹦床包含“原始/重写指令 + 绝对跳回”，一次 SIGTRAP 即引导并返回
+- x86_64：不再依赖单步。未命中模拟时，信号处理器将 RIP 设为蹦床主体起始（trunk_addr+3）。蹦床根据指令类型：
+  - 非分支：执行（可能经重写的）原始指令，随后使用 jmp [rip+0] + 8 字节字面量的绝对跳回至 orig+len。
+  - 分支（相对 CALL/JMP）：改写为间接绝对调用/跳转：
+    • CALL: `CALL [RIP+0]; JMP +8; dq target_abs`（返回后继续执行蹦床尾部并回跳到 orig+len）
+    • JMP: `JMP [RIP+0]; dq target_abs`（不追加回跳，控制流直接离开）
+- aarch64：一次 SIGTRAP，蹦床自带“指令 + 回跳/跳转”序列，语义等价。
 
 ### 4.4 重定位（指令重写）
 
@@ -354,11 +357,11 @@ stop
 
 ```plantuml
 @startuml
-title x86_64 核心执行流程
+title x86_64 核心执行流程（一次 SIGTRAP + 自包含蹦床）
 
 start
 :任何线程调用函数 F;
-note right: 函数 F 的第一条指令已被替换为 `int3` (0xcc)
+note right: 函数 F 的第一条指令已被替换为 `int3` (0xCC)
 
 :执行 `int3` 指令;
 :CPU 触发 `SIGTRAP` 信号;
@@ -372,25 +375,21 @@ if (当前线程在 TLS 中\n有函数 F 的模拟记录?) then (yes)
     :CPU 执行模拟函数 M;
   }
 else (no)
-  partition "场景 B：无需模拟（精髓）" {
-    :修改 `EFLAGS` 寄存器, **设置陷阱标志位 (TF)**;
-    note right: 进入单步调试模式
-    :修改 `RIP` 指向“蹦床”中的原始指令;
+  partition "场景 B：无需模拟" {
+    :读取蹦床地址 `trunk_addr`;
+    :将 `RIP = trunk_addr + 3`（跳过3字节头）;
     :信号处理器返回;
-    :CPU **仅执行一条** 原始指令;
-    :执行完毕后, CPU 因 TF 标志位\n**再次触发 `SIGTRAP`**;
-    :信号处理器第二次被调用;
-    :修改 `EFLAGS` 寄存器, **清除陷阱标志位 (TF)**;
-    note right: 退出单步调试模式
-    if (是否顺序落回?\nRIP == trunk_addr+3+new_len) then (yes)
-      :计算原始指令的下一条指令地址 (orig_addr+old_len);
-      :修改 `RIP` 指向该地址;
-      :信号处理器返回;
-      :CPU 从函数 F 的第二条指令\n继续无缝执行;
-    else (no)
-      :写回抑制：不修改 `RIP`，\n尊重已发生的控制流跳转;
-      :信号处理器返回;
-      :CPU 沿当前 `RIP` 继续执行;
+    :CPU 从蹦床主体开始执行;
+    if (原始首条是“非分支”) then (是)
+      :执行（可能经重写的）原始指令;
+      :执行蹦床尾部 `jmp [rip+0]; dq (orig+len)` 回到原函数下一条;
+    else (为“相对分支”) 
+      if (CALL) then (CALL)
+        :执行 `CALL [rip+0]; JMP +8; dq target_abs`;
+        :从被调函数返回后继续执行蹦床尾部并 `jmp` 回 orig+len;
+      else (JMP)
+        :执行 `JMP [rip+0]; dq target_abs` 并直接离开蹦床;
+      endif
     endif
   }
 endif
@@ -399,38 +398,14 @@ stop
 @enduml
 ```
 
-#### 术语：写回抑制（x86_64）
+#### 5.1.1 分支处理与局限
 
-- 概念：在第二次 SIGTRAP（单步执行完蹦床中的一条指令后）返回前，信号处理器检查是否“顺序落回”蹦床指令末端，即判断 RIP 是否等于 trunk_addr+3+new_len。若不相等，说明该指令改变了控制流（如 jmp/call/jcc/ret 等），此时不再将 RIP 写回 orig_addr+old_len，而是保留当前 RIP，让执行沿已发生的跳转继续，避免将已跳走的控制流强行拉回原函数。
-- 代码对应：条件判断 if rip - (trunk_addr + 3) == new_len 成立才执行写回，否则触发“写回抑制”。
-
-#### 5.1.1 当函数首条指令为跳转（jmp/call/jcc）时的行为（x86_64）
-
-- 背景：当前 x86_64 的实现仅对“RIP 相对的内存操作数”进行重写与桥接（见源码中 Instruction::is_ip_rel_memory_operand 的分支），不会重写“以立即数编码的相对控制流”（如 JMP rel8/rel32、CALL rel32、Jcc rel8/rel32）。
-- 流程回顾（未命中模拟路径时）：
-  1) 第一次 SIGTRAP：设置 EFLAGS.TF 进入单步模式；读取蹦床头（old_len/new_len/replace_reg）；若 replace_reg 非 None，则把该寄存器写为 orig_next_ip = orig_addr + old_len；随后将 RIP 指向蹦床指令处（trunk_addr+3）。
-  2) 单步执行 1 条蹦床指令；若该指令是“RIP 相对内存寻址”，则已被重写为 [reg+disp]，且 reg=orig_next_ip，行为与在原地执行等价。
-  3) 第二次 SIGTRAP：清除 TF；若此时 RIP 仍等于 trunk_addr+3+new_len（即顺序落回蹦床下一条），则写回 RIP=orig_addr+old_len 继续执行原函数后续指令。若 RIP 已被跳转改写，则不再强制写回，直接沿当前 RIP 继续。
-- 各类跳转的具体结果：
-  - jmp/call/jcc 使用“寄存器间接”或“内存间接（且为 RIP 相对内存形态，如 jmp qword ptr [rip+disp32]）”：
-    - 支持。对 RIP 相对内存形态，指令在蹦床中会被重写为 [reg+disp]，信号处理器将 reg 设置为 orig_next_ip，转移目标与原地执行一致；寄存器间接跳转本身与 RIP 无关，原地/蹦床等价。
-  - jmp/call/jcc 使用“立即数相对位移”（rel8/rel32）：
-    - 存在边界限制。蹦床中会按原 IP 重新编码出与原地相同的机器码，但在蹦床执行时，CPU 会基于“蹦床处的 RIP”计算目标地址，导致跳转目标相对偏移错误（原理：rel 位移以 next_ip 为基准，而蹦床与原地址不同）。该场景下未模拟路径可能跳转至错误位置，进而异常或崩溃。
-    - 规避建议：
-      - 若可控：避免被测函数的第一条指令为相对立即数跳转（例如在入口前插入一个无副作用的非控制流指令，或通过编译/链接选项改变布局）。
-      - 若不可控：优先对调用点进行模拟（mock 调用者），或确保首条为“间接跳转/调用”而非“相对立即数”。
-    - 后续改进方向：扩展重写器，针对相对控制流生成“装载绝对地址 + 寄存器跳转”的序列（与 aarch64 的思路类似），从而彻底消除对执行地址的依赖。
-
-#### 实现细节：写回抑制（RIP 已跳转时不覆盖）
-
-- 第二次 SIGTRAP（单步执行完蹦床指令后）中的核心逻辑是通过“是否顺序落回”来决定是否写回 RIP：
-  - 判定条件：if rip - (trunk_addr + 3) == new_len
-    - 其中 trunk_addr+3 是蹦床中重写后指令的起始地址（3 字节为蹦床头：old_len/new_len/replace_reg），new_len 为该重写指令长度。
-  - 若条件为真：说明执行完该指令后，RIP 正好位于蹦床指令之后（即顺序落回），此时将 RIP 写回 orig_addr + old_len，让 CPU 从原函数的“下一条指令”继续执行。
-  - 若条件为假：说明该指令改变了控制流（例如 jmp/call/jcc/ret 等），当前 RIP 已被改写到新的位置。为了尊重实际的控制流转移，信号处理器不再强行写回，直接沿“当前 RIP”继续执行。
-- 其他配套处理：
-  - 在第二次 SIGTRAP 中会先恢复被暂借的寄存器（replace_reg），确保寄存器语义不被破坏；RIP 的写回仅受上述“顺序落回”判定控制。
-  - 该设计确保：顺序执行路径得到精确恢复；而发生跳转时不会被错误地拉回原函数，从而保持与原地执行一致的控制流。
+- 已支持的相对分支改写：
+  - CALL rel32 -> `CALL [RIP+0]; JMP +8; dq target_abs`（返回后继续蹦床并回跳 orig+len）
+  - JMP  短/近 -> `JMP [RIP+0]; dq target_abs`（不追加回跳）
+- 仍存的局限：条件分支（Jcc rel8/rel32）作为首条指令暂未改写，若出现在入口，蹦床直接重编码将因相对位移基准改变而导致目标地址错误。规避建议：
+  - 尽量避免函数入口为 Jcc，或调整布局使首条为非分支/间接跳转；
+  - 在无法调整时，优先对调用点进行模拟（mock 调用者）。
 
 ### 5.2 aarch64 核心执行流程
 
@@ -486,9 +461,10 @@ stop
 ### 6.1 x86_64 与 aarch64 的差异（概览）
 
 - 入口陷阱：int3（1B） vs brk（4B）
-- 未模拟路径：x86_64 两次 SIGTRAP 的单步恢复 vs aarch64 一次 SIGTRAP 的直接跳回
+- 未模拟路径：两者均为一次 SIGTRAP + 自包含蹦床（原始/重写指令 + 回跳或直达分支目标）
 - 蹦床组织：x86_64 变长指令 + 3B 头；aarch64 4B 对齐 + 跳回序列 + 字面量地址
 - 指令重写：寄存器桥接 vs 绝对地址序列/重编码
+- 条件分支改写：x86_64 已支持 Jcc 的“反条件短跳 + 绝对跳转”改写；aarch64 的 B.cond 暂未实现（计划中）
 - 临时寄存器：动态选择 caller-saved vs 固定 X17
 - I-Cache：通常无需显式刷新 vs 需要 dsb sy + ic ivau + isb
 - 性能形态：精确单步（两次陷阱） vs 确定性跳回（一次陷阱）
@@ -542,8 +518,8 @@ stop
   - 将位移改写为 (EA - next_ip)，EA 为原指令计算出的有效地址，next_ip 为原指令的下一条指令地址；
   - 将重写后的机器码写入蹦床，并在蹦床头记录 old_len/new_len/replace_reg（r_tmp）。
 - 信号路径与恢复：
-  - 第一次 SIGTRAP（未命中模拟）：读取蹦床头；保存 r_tmp 原值；写 r_tmp = orig_addr + old_len；设置 TF 单步并跳入蹦床；
-  - 第二次 SIGTRAP：恢复 r_tmp 原值；若顺序落回（RIP == trunk_addr+3+new_len）则把 RIP 写回 orig_addr+old_len，否则触发“写回抑制”，保留当前 RIP。
+  - 未命中模拟：将 RIP 设为 trunk_addr+3，返回后开始执行蹦床主体。
+  - 蹦床内部：如需替换寄存器，push 保存临时寄存器；mov 临时寄存器 = orig_addr + old_len；执行重写后的指令；pop 恢复寄存器；最后通过 `jmp [rip+0]` + 8 字节字面量跳回 orig_addr + old_len。
 - 实现备注：
   - 当前实现的上下文寄存器索引映射涵盖：RAX、RBX、RCX、RDX、RDI、RSI；后续可扩展到 R8–R11 以与候选集合完全一致。
   - r_tmp 属于 caller-saved，且在第二次 SIGTRAP 恢复，满足 ABI 约定与语义正确性。
@@ -561,23 +537,27 @@ start
 :把 [rip+disp] 改写为 [r_tmp + (EA - next_ip)];
 :写入蹦床并记录 replace_reg=r_tmp, new_len;
 
-partition "SIGTRAP #1（未命中模拟）" {
+partition "SIGTRAP（未命中模拟）" {
   :读取蹦床头 old_len/new_len/replace_reg;
   :orig_next_ip = orig_addr + old_len;
   :保存 r_tmp 原值; 
   :写 r_tmp = orig_next_ip;
-  :设置 TF; RIP = trunk_addr+3; 返回;
+  :RIP = trunk_addr+3; 返回;
 }
 
 :CPU 单步执行重写后的指令;
 
-partition "SIGTRAP #2" {
-  :恢复 r_tmp 原值;
-  if (RIP == trunk_addr+3+new_len?) then (是)
-    :RIP = orig_addr+old_len; 返回;
-  else (否)
-    :写回抑制：保持当前 RIP; 返回;
+partition "蹦床执行" {
+  if (replace_reg != None?) then (是)
+    :push r_tmp;
+    :mov r_tmp = orig_next_ip;
   endif
+  :执行重写后的指令;
+  if (replace_reg != None?) then (是)
+    :pop r_tmp;
+  endif
+  :jmp [rip+0]; dq orig_next_ip;
+  :返回到 orig_next_ip 继续原函数;
 }
 stop
 @enduml
@@ -643,6 +623,24 @@ stop
 - 更强 API：如调用次数统计、参数捕获等高级能力
 
 ---
+
+### 11.3 aarch64 已知限制与待办
+
+- 分支改写覆盖范围：
+  - 已覆盖：BL（带回跳）、B（无条件跳转，不回跳）
+  - 暂未覆盖：B.cond（条件分支）。后续将参照 x86_64 的 Jcc 方案，采用“反条件短跳 + 绝对跳转 + 尾部回跳”的等价序列，保持在蹦床处语义一致。
+- BL 回跳序列布局（稳定版）：
+  - 采用 `LDR X17, #16; BLR X17; B +16; NOP; <target_abs>; LDR X16, #8; BR X16; <orig+len>` 的布局
+  - 设计要点：字面量按 8 字节对齐；从 BLR 返回后通过 `B +16` 跳过 NOP 和 8 字节字面量，直接落到回跳序列；避免“返回落入字面量导致非法执行”的风险
+- QEMU 行为差异：
+  - 在 qemu-user 环境下，aarch64 的 BL 蹦床序列仍可能在特定工具链/内核组合下出现异常或卡住（与模拟器实现与 icache 行为有关）
+  - 仓库测试中已将 aarch64 的 BL 用例临时标注为 `#[ignore]`，建议在真机 aarch64 环境通过 `cargo test -- --ignored` 进行验证
+- 指令缓存一致性：
+  - 每次向蹦床写入后均执行 `dsb sy`、`ic ivau`、`isb` 刷新指令缓存；仍建议避免在早期启动阶段修改可能尚未稳定映射/缓存的区域
+- 后续计划：
+  - 实现 B.cond 条件分支的等价改写
+  - 扩充更多入口形态与跨页/对齐边界的回归测试
+  - 在 CI 中引入真机或更稳定的 aarch64 运行环境，移除对 `#[ignore]` 的依赖
 
 ## 12. 安全与合规说明
 

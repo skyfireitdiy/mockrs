@@ -91,6 +91,7 @@ name = "mockrs"
 version = "1.2.5"
 dependencies = [
  "capstone",
+ "cc",
  "iced-x86",
  "keystone",
  "lazy_static",
