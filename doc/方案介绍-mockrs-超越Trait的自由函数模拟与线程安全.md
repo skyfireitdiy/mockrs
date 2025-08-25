@@ -173,15 +173,15 @@ SignalHandler --> [执行原始指令\n(通过蹦床)] : B.5. 重定向执行流
 title Linux 信号处理流程（从陷阱到寄存器修改再继续执行）
 
 start
-:用户线程执行函数 F 的入口;
+::用户线程执行函数 F 的入口;
 note right: 入口已被替换为 int3 (x86_64) / brk (aarch64)
 
-:执行陷阱指令 -> 触发同步异常;
-:CPU 进入内核态，内核准备信号交付;
+::执行陷阱指令 -> 触发同步异常;
+::CPU 进入内核态，内核准备信号交付;
 note right: 内核构造 sigframe，保存通用寄存器到 ucontext_t/ mcontext_t
 
-:内核将控制权转交给用户态信号处理器 (SA_SIGINFO);
-:handle_trap_signal(int sig, siginfo_t*, void* uctx) 被调用;
+::内核将控制权转交给用户态信号处理器 (SA_SIGINFO);
+::handle_trap_signal(int sig, siginfo_t*, void* uctx) 被调用;
 
 partition "用户态信号处理器" {
   if (TLS 中命中模拟?) then (是)
@@ -195,9 +195,9 @@ partition "用户态信号处理器" {
   endif
 }
 
-:信号处理器返回;
-:内核依据（可能已被修改的）ucontext 恢复用户态寄存器;
-:用户态从新的 RIP/PC 继续执行（模拟函数或蹦床）;
+::信号处理器返回;
+::内核依据（可能已被修改的）ucontext 恢复用户态寄存器;
+::用户态从新的 RIP/PC 继续执行（模拟函数或蹦床）;
 stop
 
 @enduml
@@ -339,14 +339,15 @@ stop
 
 - x86_64：不再依赖单步。未命中模拟时，信号处理器将 RIP 设为蹦床主体起始（trunk_addr+3）。蹦床根据指令类型：
   - 非分支：执行（可能经重写的）原始指令，随后使用 jmp [rip+0] + 8 字节字面量的绝对跳回至 orig+len。
-  - 分支（相对 CALL/JMP）：改写为间接绝对调用/跳转：
+  - 分支（相对 CALL/JMP/Jcc）：改写为间接绝对调用/跳转：
     • CALL: `CALL [RIP+0]; JMP +8; dq target_abs`（返回后继续执行蹦床尾部并回跳到 orig+len）
     • JMP: `JMP [RIP+0]; dq target_abs`（不追加回跳，控制流直接离开）
+    • Jcc: `Jcc.inv +14; JMP [RIP+0]; dq target_abs` (使用反向条件跳过绝对跳转，并在fall-through时执行蹦床尾部回跳)
 - aarch64：一次 SIGTRAP，蹦床自带“指令 + 回跳/跳转”序列，语义等价。
 
 ### 4.4 重定位（指令重写）
 
-- x86_64：iced-x86 识别 RIP 相对寻址，挑选未使用的 caller-saved 寄存器作为“桥接寄存器”；在信号处理器中临时写入 next_ip 并执行重写后的指令
+- x86_64：iced-x86 识别 RIP 相对寻址，挑选未使用的 caller-saved 寄存器作为“桥接寄存器”，并在蹦床中通过 `push/mov/pop` 序列完成寄存器准备与恢复。
 - aarch64：对 B/BL 等分支生成“LDR X17, #8; BR/BLR X17; <绝对地址>”；对 ADRP/ADR 在蹦床 PC 重编码或回退到“字面量装载 + 跳转/使用”；必要时对 literal LDR 采用保守序列避免 SIGILL
 
 ---
@@ -360,14 +361,14 @@ stop
 title x86_64 核心执行流程（一次 SIGTRAP + 自包含蹦床）
 
 start
-:任何线程调用函数 F;
+::任何线程调用函数 F;
 note right: 函数 F 的第一条指令已被替换为 `int3` (0xCC)
 
-:执行 `int3` 指令;
-:CPU 触发 `SIGTRAP` 信号;
+::执行 `int3` 指令;
+::CPU 触发 `SIGTRAP` 信号;
 note right: 内核激活全局信号处理器 `handle_trap_signal`
 
-:信号处理器被调用;
+::信号处理器被调用;
 if (当前线程在 TLS 中\n有函数 F 的模拟记录?) then (yes)
   partition "场景 A：需要模拟" {
     :修改 `RIP` 指向模拟函数 M;
@@ -389,6 +390,9 @@ else (no)
         :从被调函数返回后继续执行蹦床尾部并 `jmp` 回 orig+len;
       else (JMP)
         :执行 `JMP [rip+0]; dq target_abs` 并直接离开蹦床;
+      else (Jcc)
+        :执行 `Jcc.inv` / `JMP` 序列;
+        :根据条件跳转或 fall-through 到蹦床尾部并 `jmp` 回 orig+len;
       endif
     endif
   }
@@ -398,14 +402,12 @@ stop
 @enduml
 ```
 
-#### 5.1.1 分支处理与局限
+#### 5.1.1 分支处理
 
 - 已支持的相对分支改写：
-  - CALL rel32 -> `CALL [RIP+0]; JMP +8; dq target_abs`（返回后继续蹦床并回跳 orig+len）
-  - JMP  短/近 -> `JMP [RIP+0]; dq target_abs`（不追加回跳）
-- 仍存的局限：条件分支（Jcc rel8/rel32）作为首条指令暂未改写，若出现在入口，蹦床直接重编码将因相对位移基准改变而导致目标地址错误。规避建议：
-  - 尽量避免函数入口为 Jcc，或调整布局使首条为非分支/间接跳转；
-  - 在无法调整时，优先对调用点进行模拟（mock 调用者）。
+  - **CALL (rel32):** -> `CALL [RIP+0]; JMP +8; dq target_abs`（返回后，短跳过8字节地址，继续执行蹦床尾部的回跳序列，返回到 `orig+len`）
+  - **JMP (短/近):** -> `JMP [RIP+0]; dq target_abs`（不追加回跳，控制流直接离开）
+  - **Jcc (条件分支):** -> `Jcc.inv +14; JMP [RIP+0]; dq target_abs`。使用反向条件的短跳转，在条件不满足时跳过14字节的绝对跳转指令体；若条件满足，则执行绝对跳转。蹦床尾部仍包含回跳序列，用于原始 Jcc 不跳转时的 fall-through 路径。
 
 ### 5.2 aarch64 核心执行流程
 
@@ -414,14 +416,14 @@ stop
 title aarch64 核心执行流程
 
 start
-:任何线程调用函数 F;
+::任何线程调用函数 F;
 note right: 函数 F 的第一条指令已被替换为 `brk #0`
 
-:执行 `brk #0` 指令;
-:CPU 触发 `SIGTRAP` 信号;
+::执行 `brk #0` 指令;
+::CPU 触发 `SIGTRAP` 信号;
 note right: 内核激活全局信号处理器 `handle_trap_signal`
 
-:信号处理器被调用;
+::信号处理器被调用;
 if (当前线程在 TLS 中\n有函数 F 的模拟记录?) then (yes)
   partition "场景 A：需要模拟" {
     :修改 `PC` 指向模拟函数 M;
@@ -464,11 +466,11 @@ stop
 - 未模拟路径：两者均为一次 SIGTRAP + 自包含蹦床（原始/重写指令 + 回跳或直达分支目标）
 - 蹦床组织：x86_64 变长指令 + 3B 头；aarch64 4B 对齐 + 跳回序列 + 字面量地址
 - 指令重写：寄存器桥接 vs 绝对地址序列/重编码
-- 条件分支改写：x86_64 已支持 Jcc 的“反条件短跳 + 绝对跳转”改写；aarch64 的 B.cond 暂未实现（计划中）
+- 条件分支改写：x86_64 与 aarch64 均已支持条件分支改写（但 aarch64 的实现存在局限，详见 11.3）。
 - 临时寄存器：动态选择 caller-saved vs 固定 X17
 - I-Cache：通常无需显式刷新 vs 需要 dsb sy + ic ivau + isb
-- 性能形态：精确单步（两次陷阱） vs 确定性跳回（一次陷阱）
-- 兼容性：x86_64 倚重成熟单步；aarch64 强调对齐与缓存维护的保守策略
+- 性能形态：均为确定性跳回（一次陷阱），避免了两次陷阱的开销。
+- 兼容性：当前机制不依赖硬件单步，在 QEMU 等虚拟化环境下更稳定；aarch64 强调对齐与缓存维护的保守策略。
 
 ### 6.2 原因分析
 
@@ -500,29 +502,25 @@ stop
 
 ### 7.4 蹦床格式
 
-- x86_64：3 字节头（old_len/new_len/replace_reg）+ 重写后的单条指令；指令变长，无固定对齐
+- x86_64：3 字节头（old_len/new_len/replace_reg）+ 重写后的指令序列；指令变长，无固定对齐
 - aarch64：3 字节头 + 4 字节对齐填充 + 重写指令序列 + 跳回指令 + 8 字节字面量地址
 
 ### 7.5 指令重写策略
 
-- x86_64：iced-x86 解析 RIP 相对寻址，动态选择 caller-saved 寄存器作为桥接，信号路径内负责寄存器保存/恢复
+- x86_64：iced-x86 解析 RIP 相对寻址，动态选择 caller-saved 寄存器作为桥接，蹦床代码负责寄存器保存/恢复
 - aarch64：对分支/PC 相对指令进行重编码或使用“LDR X17 + BR/BLR + 字面量地址”的保守序列；在仿真环境下优先稳健方案避免 SIGILL
 
 #### 7.5.1 x86_64 临时寄存器（桥接寄存器）设计
 
-- 设计目标：当首条指令含 RIP 相对的内存操作数（如 mov rax, [rip+disp]）时，需在“蹦床地址”正确取数。做法是把该内存基址从 RIP 改写为一个“临时寄存器 r_tmp”，并在信号路径中临时把 r_tmp 设为 next_ip（orig_addr + old_len），使 [r_tmp + disp’] 与原地等价。
+- 设计目标：当首条指令含 RIP 相对的内存操作数（如 mov rax, [rip+disp]）时，需在“蹦床地址”正确取数。做法是把该内存基址从 RIP 改写为一个“临时寄存器 r_tmp”，并在蹦床代码中临时把 r_tmp 设为 next_ip（orig_addr + old_len），使 [r_tmp + disp’] 与原地等价。
 - 候选集合（遵循 System V x86_64 ABI 的 caller-saved）：{ RAX, RCX, RDX, RSI, RDI, R8, R9, R10, R11 }。
 - 选择策略：使用 iced-x86 的 InstructionInfoFactory::used_registers() 剔除所有显式/隐式已用寄存器，从候选集合中选取首个未使用者作为 r_tmp，避免破坏被测指令语义。
 - 重写与编码：
   - 将指令的内存基址从 RIP 改为 r_tmp；
   - 将位移改写为 (EA - next_ip)，EA 为原指令计算出的有效地址，next_ip 为原指令的下一条指令地址；
   - 将重写后的机器码写入蹦床，并在蹦床头记录 old_len/new_len/replace_reg（r_tmp）。
-- 信号路径与恢复：
-  - 未命中模拟：将 RIP 设为 trunk_addr+3，返回后开始执行蹦床主体。
-  - 蹦床内部：如需替换寄存器，push 保存临时寄存器；mov 临时寄存器 = orig_addr + old_len；执行重写后的指令；pop 恢复寄存器；最后通过 `jmp [rip+0]` + 8 字节字面量跳回 orig_addr + old_len。
-- 实现备注：
-  - 当前实现的上下文寄存器索引映射涵盖：RAX、RBX、RCX、RDX、RDI、RSI；后续可扩展到 R8–R11 以与候选集合完全一致。
-  - r_tmp 属于 caller-saved，且在第二次 SIGTRAP 恢复，满足 ABI 约定与语义正确性。
+- 恢复：
+  - 蹦床代码通过 `push r_tmp` / `pop r_tmp` 指令序列来保存和恢复临时寄存器，确保在执行完重写的指令后，该寄存器的值恢复原状，不影响后续的原函数执行。
 
 #### 示意图：x86_64 临时寄存器桥接流程
 
@@ -531,26 +529,21 @@ stop
 title x86_64 临时寄存器桥接流程
 
 start
-:反汇编并检测 RIP 相对内存操作数;
-:收集 used_registers();
-:从 {RAX, RCX, RDX, RSI, RDI, R8, R9, R10, R11}\n中挑选未使用的 r_tmp;
-:把 [rip+disp] 改写为 [r_tmp + (EA - next_ip)];
-:写入蹦床并记录 replace_reg=r_tmp, new_len;
+::反汇编并检测 RIP 相对内存操作数;
+::收集 used_registers();
+::从 {RAX, RCX, RDX, RSI, RDI, R8, R9, R10, R11}\n中挑选未使用的 r_tmp;
+::把 [rip+disp] 改写为 [r_tmp + (EA - next_ip)];
+::写入蹦床并记录 replace_reg=r_tmp, new_len;
 
 partition "SIGTRAP（未命中模拟）" {
-  :读取蹦床头 old_len/new_len/replace_reg;
-  :orig_next_ip = orig_addr + old_len;
-  :保存 r_tmp 原值; 
-  :写 r_tmp = orig_next_ip;
+  :读取蹦床地址 trunk_addr;
   :RIP = trunk_addr+3; 返回;
 }
-
-:CPU 单步执行重写后的指令;
 
 partition "蹦床执行" {
   if (replace_reg != None?) then (是)
     :push r_tmp;
-    :mov r_tmp = orig_next_ip;
+    :mov r_tmp, orig_next_ip;
   endif
   :执行重写后的指令;
   if (replace_reg != None?) then (是)
@@ -627,18 +620,18 @@ stop
 ### 11.3 aarch64 已知限制与待办
 
 - 分支改写覆盖范围：
-  - 已覆盖：BL（带回跳）、B（无条件跳转，不回跳）
-  - 暂未覆盖：B.cond（条件分支）。后续将参照 x86_64 的 Jcc 方案，采用“反条件短跳 + 绝对跳转 + 尾部回跳”的等价序列，保持在蹦床处语义一致。
-- BL 回跳序列布局（稳定版）：
-  - 采用 `LDR X17, #16; BLR X17; B +16; NOP; <target_abs>; LDR X16, #8; BR X16; <orig+len>` 的布局
-  - 设计要点：字面量按 8 字节对齐；从 BLR 返回后通过 `B +16` 跳过 NOP 和 8 字节字面量，直接落到回跳序列；避免“返回落入字面量导致非法执行”的风险
+  - 所有相对分支指令（包括 `B`, `BL`, `B.cond`）均被改写为通过 `X17` 寄存器进行的绝对跳转。
+  - 当前实现存在局限：
+    - `BL` 指令：从目标函数返回后，执行流不会自动跳回原函数的下一条指令（`orig+len`），可能导致执行异常。
+    - `B.cond` 指令：仅处理了分支跳转的情况；当条件不满足时，执行流不会跳回原函数的下一条指令，而是会继续执行蹦床中的后续内容（即 8 字节地址字面量），导致执行异常。
 - QEMU 行为差异：
-  - 在 qemu-user 环境下，aarch64 的 BL 蹦床序列仍可能在特定工具链/内核组合下出现异常或卡住（与模拟器实现与 icache 行为有关）
+  - 在 qemu-user 环境下，aarch64 的分支蹦床序列可能在特定工具链/内核组合下出现异常或卡住（与模拟器实现与 icache 行为有关）
   - 仓库测试中已将 aarch64 的 BL 用例临时标注为 `#[ignore]`，建议在真机 aarch64 环境通过 `cargo test -- --ignored` 进行验证
 - 指令缓存一致性：
   - 每次向蹦床写入后均执行 `dsb sy`、`ic ivau`、`isb` 刷新指令缓存；仍建议避免在早期启动阶段修改可能尚未稳定映射/缓存的区域
 - 后续计划：
-  - 实现 B.cond 条件分支的等价改写
+  - 为 `BL` 指令实现带返回的蹦床序列，确保返回后能正确跳转回 `orig+len`。
+  - 为 `B.cond` 条件分支实现 fall-through 路径，确保条件不满足时能正确跳转回 `orig+len`。
   - 扩充更多入口形态与跨页/对齐边界的回归测试
   - 在 CI 中引入真机或更稳定的 aarch64 运行环境，移除对 `#[ignore]` 的依赖
 
