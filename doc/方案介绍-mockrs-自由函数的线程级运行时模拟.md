@@ -359,14 +359,14 @@ stop
 title x86_64 核心执行流程（一次 SIGTRAP + 自包含蹦床）
 
 start
-::任何线程调用函数 F;
+:任何线程调用函数 F;
 note right: 函数 F 的第一条指令已被替换为 `int3` (0xCC)
 
-::执行 `int3` 指令;
-::CPU 触发 `SIGTRAP` 信号;
+:执行 `int3` 指令;
+:CPU 触发 `SIGTRAP` 信号;
 note right: 内核激活全局信号处理器 `handle_trap_signal`
 
-::信号处理器被调用;
+:信号处理器被调用;
 if (当前线程在 TLS 中\n有函数 F 的模拟记录?) then (yes)
   partition "场景 A：需要模拟" {
     :修改 `RIP` 指向模拟函数 M;
@@ -382,11 +382,11 @@ else (no)
     if (原始首条是“非分支”) then (是)
       :执行（可能经重写的）原始指令;
       :执行蹦床尾部 `jmp [rip+0]; dq (orig+len)` 回到原函数下一条;
-    else (为“相对分支”) 
-      if (CALL) then (CALL)
+    else (为“相对分支”)
+      if (CALL?) then (CALL)
         :执行 `CALL [rip+0]; JMP +8; dq target_abs`;
         :从被调函数返回后继续执行蹦床尾部并 `jmp` 回 orig+len;
-      else (JMP)
+      elseif (JMP?) then (JMP)
         :执行 `JMP [rip+0]; dq target_abs` 并直接离开蹦床;
       else (Jcc)
         :执行 `Jcc.inv` / `JMP` 序列;
